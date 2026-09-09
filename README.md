@@ -21,25 +21,40 @@ npm install
 npx playwright install chromium
 
 # List courses (opens browser once for login; session is reused)
+# Slug or full URL both work:
+npm run skoolvault -- list ai-first-client-formula-8589
 npm run skoolvault -- list https://www.skool.com/YOUR-GROUP/classroom
 
 # Archive classroom metadata + Markdown/JSON (no media yet)
-npm run skoolvault -- pull https://www.skool.com/YOUR-GROUP/classroom
+npm run skoolvault -- pull YOUR-GROUP
 
-# Full classroom backup with MP4s + files
-npm run skoolvault -- pull https://www.skool.com/YOUR-GROUP/classroom --videos --files
+# Classroom + community wall + MP4s + files (local; same shape as GH Action)
+npm run skoolvault -- pull YOUR-GROUP --feed --videos --files --comments
 
 # One course by title filter
-npm run skoolvault -- pull https://www.skool.com/YOUR-GROUP/classroom --course "Week 1" --videos
+npm run skoolvault -- pull YOUR-GROUP --course "Week 1" --videos
 
-# Feed + comments
-npm run skoolvault -- pull https://www.skool.com/YOUR-GROUP --feed --comments
+# Feed + comments only extras on a classroom pull (or bare community URL)
+npm run skoolvault -- pull YOUR-GROUP --feed --comments
 
-# Cookie auth (Cookie-Editor export) + headless
-npm run skoolvault -- pull https://www.skool.com/YOUR-GROUP/classroom --cookies ./cookies.json --headless --videos
+# Cookie auth (Cookie-Editor export) + headless — local or CI
+npm run skoolvault -- pull YOUR-GROUP --cookies ./cookies.json --headless --feed --videos --files
 ```
 
 ## Output layout (community-first)
+
+Everything lands under `output/<community-slug>/` (change root with `--out`).
+
+| What                                      | Where                                              |
+| ----------------------------------------- | -------------------------------------------------- |
+| Lesson docs                               | `courses/<course>/lessons/*.md` + `*.json`         |
+| Mux / Loom / YouTube / etc. video         | `courses/<course>/media/*.mp4`                     |
+| Attachments (PDF, n8n JSON, images, zip…) | `courses/<course>/files/`                          |
+| Feed                                      | `feed/posts.json`                                  |
+| Resume + meta                             | `progress.json`, `meta.json`, `courses/index.json` |
+| Session (local reuse)                     | `output/.session.json`                             |
+
+Inline CDN images in lesson HTML usually stay as remote URLs in the Markdown — only **Skool file attachments** are downloaded into `files/`. No separate MP3 pipeline; audio only appears if an attachment is audio, or yt-dlp happens to emit audio as part of a video merge (final target is still `.mp4`).
 
 ```
 output/
@@ -48,11 +63,11 @@ output/
     ├── progress.json          # resume state for THIS community
     ├── courses/
     │   ├── index.json
-    │   └── course-slug/
+    │   └── course-slug--hash/
     │       ├── course.json
     │       ├── lessons/       # *.json + *.md
     │       ├── media/         # *.mp4
-    │       └── files/         # PDFs / attachments
+    │       └── files/         # PDFs / JSON / images / zips
     ├── feed/
     │   └── posts.json
     ├── about/
@@ -61,21 +76,45 @@ output/
 
 A second community → a new sibling folder. Re-runs update the same community folder and skip completed lessons/videos.
 
+## GitHub Actions (cookie secret, not password)
+
+Password login is fragile (WAF / OAuth / 2FA). CI uses **cookies**. Same CLI works locally.
+
+1. Log in locally once → export Cookie-Editor JSON (must include `auth_token` for `skool.com`).
+2. Repo → Settings → Secrets → `SKOOL_COOKIES` = that JSON blob.
+3. Actions → **SkoolVault archive** → Run workflow — fill in:
+   - **community** — slug only, e.g. `ai-first-client-formula-8589`
+   - **videos / files / comments** — toggles (classroom + community feed always run)
+   - optional **course** title filter / **max_feed**
+4. Download artifact **`skoolvault-<slug>`** — same tree as local `output/<slug>/`.
+
+Local twin of a full Action run:
+
+```bash
+npm run skoolvault -- pull ai-first-client-formula-8589 \
+  --cookies ./cookies.json --headless --feed --videos --files --comments
+```
+
+Workflow: [`.github/workflows/skoolvault.yml`](./.github/workflows/skoolvault.yml). Refresh the secret when the session expires — headless runs **fail fast** (no 5‑minute login wait).
+
 ## Commands
 
-| Command      | Purpose                       |
-| ------------ | ----------------------------- |
-| `list <url>` | Print courses (id/hash/title) |
-| `pull <url>` | Archive based on URL shape    |
+| Command         | Purpose                       |
+| --------------- | ----------------------------- |
+| `list <target>` | Print courses (id/hash/title) |
+| `pull <target>` | Archive based on slug or URL  |
+
+`target` = community slug (`my-group`) or full Skool URL.
 
 ### URL routing
 
-| URL                                   | Behavior                                              |
+| Target                                | Behavior                                              |
 | ------------------------------------- | ----------------------------------------------------- |
+| `my-group` (slug)                     | Classroom (add `--feed` for community wall too)       |
 | `/group/classroom`                    | All accessible courses                                |
 | `/group/classroom/{hash}`             | One course                                            |
 | `/group/classroom/{hash}?md={lesson}` | Still scrapes that course (lesson-focused navigation) |
-| `/group` + `--feed`                   | Community wall                                        |
+| `/group` + `--feed`                   | Classroom + community wall                            |
 | `/group?s=newest&p=1`                 | Feed with Skool query preserved                       |
 
 ### Useful flags

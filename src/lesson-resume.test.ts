@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { normalizeSameSite } from "./auth.js";
+import {
+  cookieExpiresUnix,
+  hasAuthTokenCookie,
+  normalizeSameSite,
+} from "./auth.js";
 import {
   buildExternalExpected,
   externalVideoPath,
@@ -29,6 +33,37 @@ check("normalizeSameSite maps Cookie-Editor values", () => {
   assert.equal(normalizeSameSite("no_restriction"), "None");
   assert.equal(normalizeSameSite("None"), "None");
   assert.equal(normalizeSameSite(undefined), "Lax");
+});
+
+check("hasAuthTokenCookie rejects guest WAF-only cookies", () => {
+  assert.equal(
+    hasAuthTokenCookie([
+      { name: "aws-waf-token", domain: ".skool.com" },
+      { name: "client_id", domain: ".skool.com" },
+    ]),
+    false,
+  );
+  assert.equal(
+    hasAuthTokenCookie([{ name: "auth_token", domain: ".skool.com" }]),
+    true,
+  );
+  assert.equal(
+    hasAuthTokenCookie([
+      { name: "auth_token", domain: ".skool.com", value: "" },
+    ]),
+    false,
+  );
+  assert.equal(
+    hasAuthTokenCookie([{ name: "auth_token", value: "tok" }]),
+    true,
+  );
+});
+
+check("cookieExpiresUnix normalizes Cookie-Editor ms", () => {
+  assert.equal(cookieExpiresUnix(1_700_000_000), 1_700_000_000);
+  assert.equal(cookieExpiresUnix(1_700_000_000_000), 1_700_000_000);
+  assert.equal(cookieExpiresUnix(-1), -1);
+  assert.equal(cookieExpiresUnix(undefined), -1);
 });
 
 check("external paths are URL-stable (not index-based)", () => {

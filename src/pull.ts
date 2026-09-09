@@ -75,6 +75,8 @@ export interface PullOptions {
   delayMaxMs?: number;
   dryRun?: boolean;
   rateLimit?: RateLimitState;
+  /** When false (headless/CI), expire session fails fast. Default true. */
+  interactiveLogin?: boolean;
 }
 
 function lessonToMarkdown(lesson: Lesson): string {
@@ -204,12 +206,10 @@ async function scrapeOneCourse(
   });
 
   const courseUrl = `${opts.parsed.communityUrl}/classroom/${course.nameHash}`;
-  await ensureAuth(
-    opts.page,
-    opts.parsed.communityUrl,
-    opts.sessionFile,
-    courseUrl,
-  );
+  await ensureAuth(opts.page, opts.parsed.communityUrl, opts.sessionFile, {
+    returnUrl: courseUrl,
+    interactive: opts.interactiveLogin,
+  });
 
   const tree = await extractCourseLessonTree(opts.page);
   if (!tree.length) {
@@ -296,12 +296,10 @@ async function scrapeOneCourse(
       timeout: 60_000,
     });
     await sleep(2500);
-    await ensureAuth(
-      opts.page,
-      opts.parsed.communityUrl,
-      opts.sessionFile,
-      lessonUrl,
-    );
+    await ensureAuth(opts.page, opts.parsed.communityUrl, opts.sessionFile, {
+      returnUrl: lessonUrl,
+      interactive: opts.interactiveLogin,
+    });
 
     if (!opts.page.url().includes(`md=${node.id}`)) {
       log.warn(
@@ -547,12 +545,10 @@ async function pullCommunityInner(opts: PullOptions): Promise<void> {
       timeout: 60_000,
     });
     await sleep(4000);
-    await ensureAuth(
-      opts.page,
-      opts.parsed.communityUrl,
-      opts.sessionFile,
-      opts.parsed.classroomUrl,
-    );
+    await ensureAuth(opts.page, opts.parsed.communityUrl, opts.sessionFile, {
+      returnUrl: opts.parsed.classroomUrl,
+      interactive: opts.interactiveLogin,
+    });
 
     let courses = await listCourses(opts.page, opts.skipLocked !== false);
 
@@ -614,12 +610,10 @@ async function pullCommunityInner(opts: PullOptions): Promise<void> {
       timeout: 60_000,
     });
     await sleep(4000);
-    await ensureAuth(
-      opts.page,
-      opts.parsed.communityUrl,
-      opts.sessionFile,
-      feedUrl,
-    );
+    await ensureAuth(opts.page, opts.parsed.communityUrl, opts.sessionFile, {
+      returnUrl: feedUrl,
+      interactive: opts.interactiveLogin,
+    });
 
     const maxFeed = opts.maxFeedPosts ?? 50;
     const posts = await extractFeedPosts(opts.page, maxFeed);
@@ -668,17 +662,16 @@ export async function listOnly(opts: {
   page: Page;
   sessionFile: string;
   skipLocked?: boolean;
+  interactiveLogin?: boolean;
 }): Promise<Course[]> {
   await opts.page.goto(opts.parsed.classroomUrl, {
     waitUntil: "domcontentloaded",
     timeout: 60_000,
   });
   await sleep(4000);
-  await ensureAuth(
-    opts.page,
-    opts.parsed.communityUrl,
-    opts.sessionFile,
-    opts.parsed.classroomUrl,
-  );
+  await ensureAuth(opts.page, opts.parsed.communityUrl, opts.sessionFile, {
+    returnUrl: opts.parsed.classroomUrl,
+    interactive: opts.interactiveLogin,
+  });
   return listCourses(opts.page, opts.skipLocked !== false);
 }

@@ -31,19 +31,36 @@ export function normalizeSameSite(raw: unknown): "Strict" | "Lax" | "None" {
   return "Lax";
 }
 
+/** True if storage has Skool's session cookie (guest WAF cookies alone don't count). */
+export function hasAuthTokenCookie(
+  cookies: { name: string; domain?: string; value?: string }[],
+): boolean {
+  return cookies.some(
+    (c) =>
+      c.name === "auth_token" &&
+      (c.value === undefined || c.value.length > 0) &&
+      (!c.domain || c.domain.includes("skool.com")),
+  );
+}
+
+/** Cookie-Editor may use ms; Playwright storageState uses Unix seconds. */
+export function cookieExpiresUnix(raw: unknown): number {
+  if (typeof raw !== "number" || !Number.isFinite(raw) || raw <= 0) return -1;
+  return raw > 1e12 ? Math.floor(raw / 1000) : raw;
+}
+
 function cookieFileToStorageState(cookiesFile: string): {
   cookies: unknown[];
   origins: [];
 } {
   const raw = JSON.parse(fs.readFileSync(cookiesFile, "utf8")) as unknown;
-  // Cookie-Editor export is usually an array; Playwright storageState wants {cookies, origins}
   if (Array.isArray(raw)) {
     const cookies = raw.map((c: Record<string, unknown>) => ({
       name: String(c.name),
-      value: String(c.value),
+      value: String(c.value ?? ""),
       domain: String(c.domain ?? ".skool.com"),
       path: String(c.path ?? "/"),
-      expires: typeof c.expirationDate === "number" ? c.expirationDate : -1,
+      expires: cookieExpiresUnix(c.expirationDate ?? c.expires),
       httpOnly: Boolean(c.httpOnly),
       secure: Boolean(c.secure ?? true),
       sameSite: normalizeSameSite(c.sameSite),
@@ -55,6 +72,7 @@ function cookieFileToStorageState(cookiesFile: string): {
     return {
       cookies: state.cookies.map((c) => ({
         ...c,
+        expires: cookieExpiresUnix(c.expires ?? c.expirationDate),
         sameSite: normalizeSameSite(c.sameSite),
       })),
       origins: state.origins ?? [],
@@ -65,24 +83,74 @@ function cookieFileToStorageState(cookiesFile: string): {
   );
 }
 
+/**
+ * Real login check — public Skool pages do NOT redirect guests to /login,
+ * so URL alone is not enough. Require auth_token + a self user in page data.
+ */
+export async function isLoggedIn(page: Page): Promise<boolean> {
+  const url = page.url();
+  if (url.includes("/login") || url.includes("/signup")) return false;
+
+  const cookies = await page.context().cookies("https://www.skool.com/");
+  if (!hasAuthTokenCookie(cookies)) return false;
+
+  return page.evaluate(() => {
+    const el = document.querySelector("script#__NEXT_DATA__");
+    if (!el?.textContent) return false;
+    try {
+      const data = JSON.parse(el.textContent) as {
+        props?: {
+          pageProps?: {
+            self?: { id?: string };
+            renderData?: { self?: { id?: string } };
+          };
+        };
+      };
+      const pp = data.props?.pageProps;
+      const self = pp?.self || pp?.renderData?.self;
+      return Boolean(self?.id);
+    } catch {
+      return false;
+    }
+  });
+}
+
 async function waitForLogin(page: Page, timeoutMs = 300_000): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     await sleep(2000);
     try {
-      const url = page.url();
-      if (
-        url.includes("skool.com") &&
-        !url.includes("/login") &&
-        !url.includes("/signup")
-      ) {
-        return;
-      }
+      if (await isLoggedIn(page)) return;
     } catch {
       // navigating
     }
   }
-  throw new Error("Login timed out after 5 minutes");
+  throw new Error(
+    "Login timed out after 5 minutes (need auth_token cookie + logged-in user)",
+  );
+}
+
+async function forceLogin(
+  page: Page,
+  context: BrowserContext,
+  sessionFile: string,
+  communityUrl: string,
+): Promise<void> {
+  log.step("Log in to Skool in the browser window (detected automatically)");
+  await page.goto("https://www.skool.com/login", {
+    waitUntil: "domcontentloaded",
+  });
+  await waitForLogin(page);
+  log.ok("Login detected (auth_token + user)");
+  await context.storageState({ path: sessionFile });
+  log.ok(`Session saved → ${sessionFile}`);
+  await page.goto(communityUrl, { waitUntil: "domcontentloaded" });
+  await sleep(2000);
+  if (!(await isLoggedIn(page))) {
+    throw new Error(
+      "Login cookie saved but community page still looks logged out",
+    );
+  }
 }
 
 export async function openAuthenticatedSession(
@@ -128,23 +196,20 @@ export async function openAuthenticatedSession(
   });
   await sleep(2000);
 
-  if (page.url().includes("/login") || page.url().includes("/signup")) {
+  if (!(await isLoggedIn(page))) {
     if (!headed) {
       await browser.close();
       throw new Error(
-        "Login required. Re-run without --headless, or pass --cookies <file>",
+        "Not logged in (missing auth_token / user). Re-run without --headless, or pass --cookies <file> with auth_token.",
       );
     }
-    log.step("Log in to Skool in the browser window (detected automatically)");
-    await page.goto("https://www.skool.com/login", {
-      waitUntil: "domcontentloaded",
-    });
-    await waitForLogin(page);
-    log.ok("Login detected");
-    await context.storageState({ path: opts.sessionFile });
-    log.ok(`Session saved → ${opts.sessionFile}`);
-    await page.goto(opts.communityUrl, { waitUntil: "domcontentloaded" });
-    await sleep(2000);
+    // Drop stale guest session so we don't keep reusing it
+    try {
+      if (fs.existsSync(opts.sessionFile)) fs.unlinkSync(opts.sessionFile);
+    } catch {
+      // ignore
+    }
+    await forceLogin(page, context, opts.sessionFile, opts.communityUrl);
   } else {
     await context.storageState({ path: opts.sessionFile });
     log.ok("Authenticated session ready");
@@ -157,19 +222,41 @@ export async function ensureAuth(
   page: Page,
   communityUrl: string,
   sessionFile: string,
-  /** Page to reopen after re-login (lesson/course URL). Defaults to community. */
-  returnUrl?: string,
+  opts?: {
+    /** Page to reopen after re-login (lesson/course URL). Defaults to community. */
+    returnUrl?: string;
+    /** When false (headless/CI), fail immediately — no 5min login wait. Default true. */
+    interactive?: boolean;
+  },
 ): Promise<void> {
-  if (page.url().includes("/login") || page.url().includes("/signup")) {
-    log.warn("Session expired — log in again in the browser");
-    await waitForLogin(page);
-    await page.context().storageState({ path: sessionFile });
-    const target = returnUrl || communityUrl;
-    await page.goto(target, { waitUntil: "domcontentloaded" });
+  const interactive = opts?.interactive !== false;
+  const returnUrl = opts?.returnUrl;
+  const onAuthWall =
+    page.url().includes("/login") || page.url().includes("/signup");
+  if (!onAuthWall && (await isLoggedIn(page))) return;
+
+  if (!interactive) {
+    throw new Error(
+      "Session expired (missing auth_token / user). Refresh SKOOL_COOKIES / --cookies, or re-run without --headless.",
+    );
+  }
+
+  log.warn("Session missing/expired — log in again in the browser");
+  await page.goto("https://www.skool.com/login", {
+    waitUntil: "domcontentloaded",
+  });
+  await waitForLogin(page);
+  await page.context().storageState({ path: sessionFile });
+  const target = returnUrl || communityUrl;
+  await page.goto(target, { waitUntil: "domcontentloaded" });
+  await sleep(2000);
+  if (!(await isLoggedIn(page))) {
+    await page.goto(communityUrl, { waitUntil: "domcontentloaded" });
     await sleep(2000);
-    if (page.url().includes("/login") || page.url().includes("/signup")) {
-      await page.goto(communityUrl, { waitUntil: "domcontentloaded" });
-      await sleep(2000);
-    }
+  }
+  if (!(await isLoggedIn(page))) {
+    throw new Error(
+      "Re-login failed — still missing auth_token / logged-in user",
+    );
   }
 }

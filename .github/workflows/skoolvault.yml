@@ -1,0 +1,164 @@
+# Archive a Skool community headless (cookie auth — not username/password).
+#
+# Secrets:
+#   SKOOL_COOKIES — Cookie-Editor JSON array OR Playwright storageState JSON
+#                   Must include auth_token for skool.com
+#
+# Fill in when running (Actions → SkoolVault archive → Run workflow):
+#   community — slug only, e.g. ai-first-client-formula-8589
+#   then toggle videos / files / comments / course filter as you like
+#
+# Always archives classroom + community feed into output/<slug>/,
+# then uploads artifact skoolvault-<slug>.
+#
+# Local equivalent (same slug works — no need for full URL):
+#   npm run skoolvault -- pull ai-first-client-formula-8589 --feed --videos --files --comments
+
+name: SkoolVault archive
+
+on:
+  workflow_dispatch:
+    inputs:
+      community:
+        description: "Community slug only (e.g. ai-first-client-formula-8589)"
+        required: true
+        type: string
+      videos:
+        description: "Download Mux + external videos (MP4)"
+        required: true
+        type: boolean
+        default: true
+      files:
+        description: "Download lesson attachments (PDF / JSON / images / zip)"
+        required: true
+        type: boolean
+        default: true
+      comments:
+        description: "Fetch nested comments on community feed posts"
+        required: true
+        type: boolean
+        default: true
+      course:
+        description: "Optional: only courses whose title matches this text"
+        required: false
+        type: string
+        default: ""
+      max_feed:
+        description: "Max feed posts to archive (integer)"
+        required: false
+        type: string
+        default: "50"
+
+permissions:
+  contents: read
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install system deps (ffmpeg + yt-dlp)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+          sudo chmod a+rx /usr/local/bin/yt-dlp
+          ffmpeg -version | head -1
+          yt-dlp --version
+
+      - name: Install npm + Chromium
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Write cookies from secret
+        env:
+          SKOOL_COOKIES: ${{ secrets.SKOOL_COOKIES }}
+        run: |
+          if [ -z "$SKOOL_COOKIES" ]; then
+            echo "::error::Missing secret SKOOL_COOKIES (Cookie-Editor / storageState JSON with auth_token)"
+            exit 1
+          fi
+          printf '%s' "$SKOOL_COOKIES" > cookies.json
+          # Align with src/auth.ts hasAuthTokenCookie (domain optional; value non-empty)
+          node -e "
+            const j = JSON.parse(require('fs').readFileSync('cookies.json','utf8'));
+            const cookies = Array.isArray(j) ? j : (j.cookies || []);
+            const ok = cookies.some(c =>
+              c.name === 'auth_token' &&
+              typeof c.value === 'string' && c.value.length > 0 &&
+              (!c.domain || String(c.domain).includes('skool.com'))
+            );
+            if (!ok) {
+              console.error('SKOOL_COOKIES must include non-empty auth_token for skool.com');
+              process.exit(1);
+            }
+            console.log('Cookies OK (' + cookies.length + ' entries, auth_token present)');
+          "
+
+      - name: Normalize community slug
+        id: slug
+        env:
+          RAW: ${{ inputs.community }}
+          MAX_FEED: ${{ inputs.max_feed }}
+        run: |
+          set -euo pipefail
+          # Accept slug, path, or full URL — keep first path segment only
+          SLUG="$RAW"
+          SLUG="${SLUG#https://www.skool.com/}"
+          SLUG="${SLUG#http://www.skool.com/}"
+          SLUG="${SLUG#https://skool.com/}"
+          SLUG="${SLUG#http://skool.com/}"
+          SLUG="${SLUG%%\?*}"
+          SLUG="${SLUG%%/*}"
+          SLUG="$(printf '%s' "$SLUG" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+          if ! printf '%s' "$SLUG" | grep -Eq '^[a-z0-9][a-z0-9_-]*$'; then
+            echo "::error::Bad community slug: '$RAW' → '$SLUG' (use e.g. ai-first-client-formula-8589)"
+            exit 1
+          fi
+          MF="${MAX_FEED:-50}"
+          if ! printf '%s' "$MF" | grep -Eq '^[0-9]+$'; then
+            echo "::error::max_feed must be a non-negative integer (got '$MF')"
+            exit 1
+          fi
+          echo "slug=$SLUG" >> "$GITHUB_OUTPUT"
+          echo "max_feed=$MF" >> "$GITHUB_OUTPUT"
+          echo "Community: $SLUG (classroom + community feed, max_feed=$MF)"
+
+      - name: Pull classroom + community feed
+        env:
+          SLUG: ${{ steps.slug.outputs.slug }}
+          COURSE: ${{ inputs.course }}
+          MAX_FEED: ${{ steps.slug.outputs.max_feed }}
+          DO_VIDEOS: ${{ inputs.videos }}
+          DO_FILES: ${{ inputs.files }}
+          DO_COMMENTS: ${{ inputs.comments }}
+        run: |
+          set -euo pipefail
+          # Bare slug → classroom + --feed (community wall). Same as local CLI.
+          ARGS=(pull "$SLUG" --out output --cookies cookies.json --headless --feed --max-feed "$MAX_FEED")
+          if [ "$DO_VIDEOS" = "true" ]; then ARGS+=(--videos); fi
+          if [ "$DO_FILES" = "true" ]; then ARGS+=(--files); fi
+          if [ "$DO_COMMENTS" = "true" ]; then ARGS+=(--comments); fi
+          if [ -n "${COURSE// }" ]; then ARGS+=(--course "$COURSE"); fi
+          echo "Running: npm run skoolvault -- ${ARGS[*]}"
+          npm run skoolvault -- "${ARGS[@]}"
+
+      - name: Upload archive artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: skoolvault-${{ steps.slug.outputs.slug }}
+          path: output/${{ steps.slug.outputs.slug }}/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Cleanup cookies
+        if: always()
+        run: rm -f cookies.json
