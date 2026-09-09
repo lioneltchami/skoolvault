@@ -89,7 +89,7 @@ A second community → a new sibling folder. Re-runs update the same community f
 - `--out <dir>` — change archive root (still one folder per community)
 - `--cookies <file>` — Cookie-Editor JSON (needs `auth_token`)
 
-On HTTP 429 (and API/Mux 403), pulls automatically back off before the next navigation. Progress writes are atomic; corrupted `progress.json` resets safely.
+On HTTP 429 (and API/Mux 403), pulls automatically back off before the next navigation. Progress writes are atomic; corrupted `progress.json` resets safely. Feed re-runs **merge** posts by id (never wipe a larger archive). Empty classroom listings abort instead of overwriting `courses/index.json`.
 
 Session cookies are stored at `output/.session.json` and reused across communities.
 

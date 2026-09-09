@@ -14,7 +14,8 @@
     "test:url": "tsx src/url.test.ts",
     "test:classroom": "tsx src/extractors/classroom.test.ts",
     "test:progress": "tsx src/progress.test.ts",
-    "test": "npm run test:url && npm run test:classroom && npm run test:progress",
+    "test:resume": "tsx src/lesson-resume.test.ts",
+    "test": "npm run test:url && npm run test:classroom && npm run test:progress && npm run test:resume",
     "postinstall": "playwright install chromium"
   },
   "engines": {

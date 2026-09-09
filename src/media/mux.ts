@@ -27,6 +27,13 @@ export function assertFfmpegAvailable(): void {
 
 function runFfmpeg(hlsUrl: string, outputPath: string): Promise<void> {
   return new Promise((resolve, reject) => {
+    fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+    const partPath = `${outputPath}.part`;
+    try {
+      if (fs.existsSync(partPath)) fs.unlinkSync(partPath);
+    } catch {
+      // ignore
+    }
     const args = [
       "-y",
       "-loglevel",
@@ -41,7 +48,7 @@ function runFfmpeg(hlsUrl: string, outputPath: string): Promise<void> {
       "aac_adtstoasc",
       "-movflags",
       "+faststart",
-      outputPath,
+      partPath,
     ];
     const child = spawn("ffmpeg", args, {
       stdio: ["ignore", "ignore", "pipe"],
@@ -51,7 +58,7 @@ function runFfmpeg(hlsUrl: string, outputPath: string): Promise<void> {
 
     const cleanupPartial = () => {
       try {
-        if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+        if (fs.existsSync(partPath)) fs.unlinkSync(partPath);
       } catch {
         // ignore
       }
@@ -88,8 +95,20 @@ function runFfmpeg(hlsUrl: string, outputPath: string): Promise<void> {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      if (code === 0) resolve();
-      else {
+      if (code === 0) {
+        try {
+          if (!fs.existsSync(partPath) || fs.statSync(partPath).size < 1024) {
+            cleanupPartial();
+            reject(new Error("Download produced empty file"));
+            return;
+          }
+          fs.renameSync(partPath, outputPath);
+          resolve();
+        } catch (e) {
+          cleanupPartial();
+          reject(e instanceof Error ? e : new Error(String(e)));
+        }
+      } else {
         cleanupPartial();
         reject(new Error(err.slice(-400) || `ffmpeg exited ${code}`));
       }
@@ -168,7 +187,11 @@ export async function resolveAndDownloadMux(opts: {
   return {
     source: "mux",
     playbackId: tokenInfo.playbackId,
-    durationMs: tokenInfo.duration,
+    // Skool/Mux duration is seconds; schema field is milliseconds
+    durationMs:
+      tokenInfo.duration != null
+        ? Math.round(tokenInfo.duration * 1000)
+        : undefined,
     localPath: opts.outputPath,
   };
 }
@@ -192,7 +215,10 @@ export function detectExternalVideoUrls(text: string): VideoRef[] {
   ];
   for (const { source, re } of patterns) {
     const matches = text.match(re) || [];
-    for (const url of matches) refs.push({ source, url });
+    for (const url of matches) {
+      if (refs.some((r) => r.url === url)) continue;
+      refs.push({ source, url });
+    }
   }
   return refs;
 }

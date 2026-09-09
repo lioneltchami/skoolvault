@@ -10,6 +10,12 @@ import {
 } from "./extractors/classroom.js";
 import { extractFeedPosts, fetchPostComments } from "./extractors/feed.js";
 import { extractLessonBody } from "./extractors/lesson-content.js";
+import {
+  externalVideoHints,
+  lessonNeedsRework,
+  mergePriorLocalPaths,
+  resolveLessonBase,
+} from "./lesson-resume.js";
 import { downloadSkoolFile } from "./media/files.js";
 import {
   assertFfmpegAvailable,
@@ -35,7 +41,6 @@ import {
   courseFolderKey,
   ensureCommunityLayout,
   ensureCourseLayout,
-  lessonBasename,
   readJson,
   writeCommunityMeta,
   writeFeedPostsJson,
@@ -175,10 +180,6 @@ async function scrapeOneCourse(
 ): Promise<void> {
   const folderKey = courseFolderKey(course);
   const layout = ensureCourseLayout(paths, folderKey);
-  writeJson(layout.courseJson, {
-    ...course,
-    scrapedAt: new Date().toISOString(),
-  });
 
   const loaded = await loadCoursePage(
     opts.page,
@@ -191,11 +192,20 @@ async function scrapeOneCourse(
     );
     return;
   }
-  // Click-from-index / DOM-only courses: recover nameHash from the live URL
   const hashFromUrl = opts.page.url().match(/\/classroom\/([^/?#]+)/)?.[1];
   if (hashFromUrl) course.nameHash = hashFromUrl;
 
-  await ensureAuth(opts.page, opts.parsed.communityUrl, opts.sessionFile);
+  writeJson(layout.courseJson, {
+    ...course,
+    scrapedAt: new Date().toISOString(),
+  });
+
+  await ensureAuth(
+    opts.page,
+    opts.parsed.communityUrl,
+    opts.sessionFile,
+    opts.page.url(),
+  );
 
   const tree = await extractCourseLessonTree(opts.page);
   if (!tree.length) {
@@ -221,38 +231,42 @@ async function scrapeOneCourse(
   for (const node of tree) {
     if (lessonFilter && node.id !== lessonFilter) continue;
 
-    const base = lessonBasename(node.position, node.title);
+    const { base, jsonPath: lessonJsonPath } = resolveLessonBase(
+      layout.lessons,
+      node,
+    );
     const outMp4 = path.join(layout.media, `${base}.mp4`);
     const videoKey = `${folderKey}:${node.id}`;
-    const lessonJsonPath = path.join(layout.lessons, `${base}.json`);
+    const externalsHint = externalVideoHints(node);
+    const externalExpected = externalsHint
+      .filter((v) => ["loom", "vimeo", "youtube", "wistia"].includes(v.source))
+      .map((v, i) => ({
+        path: path.join(layout.media, `${base}-${v.source}-${i + 1}.mp4`),
+      }));
+    const wantedFileIds = parseResources(node.resourcesRaw)
+      .map((r) => r.fileId)
+      .filter((id): id is string => Boolean(id));
+    const existingLesson = readJson<{
+      files?: { fileId?: string; localPath?: string }[];
+    }>(lessonJsonPath);
 
-    // Resume: skip only when lesson complete AND requested artifacts ok on disk.
-    if (isLessonDone(progress, folderKey, node.id)) {
-      const needsVideoRepair =
-        Boolean(opts.videos) &&
-        Boolean(node.videoId) &&
-        (isVideoFailed(progress, videoKey) || !fs.existsSync(outMp4));
+    const rework = lessonNeedsRework({
+      lessonDone: isLessonDone(progress, folderKey, node.id),
+      videos: Boolean(opts.videos),
+      files: Boolean(opts.files),
+      muxVideoId: node.videoId,
+      muxMp4Exists: fs.existsSync(outMp4),
+      muxVideoFailed: isVideoFailed(progress, videoKey),
+      externalExpected,
+      fileIdsWanted: wantedFileIds,
+      existingFiles: existingLesson?.files,
+    });
 
-      let needsFileRepair = false;
-      if (opts.files) {
-        const wantedIds = parseResources(node.resourcesRaw)
-          .map((r) => r.fileId)
-          .filter((id): id is string => Boolean(id));
-        if (wantedIds.length) {
-          const existing = readJson<{
-            files?: { fileId?: string; localPath?: string }[];
-          }>(lessonJsonPath);
-          needsFileRepair = wantedIds.some((id) => {
-            const f = existing?.files?.find((x) => x.fileId === id);
-            return !f?.localPath || !fs.existsSync(f.localPath);
-          });
-        }
-      }
-
-      if (!needsVideoRepair && !needsFileRepair) {
-        log.skip(`${node.title}`);
-        continue;
-      }
+    if (isLessonDone(progress, folderKey, node.id) && !rework) {
+      log.skip(`${node.title}`);
+      continue;
+    }
+    if (isLessonDone(progress, folderKey, node.id) && rework) {
       log.info(`Retry media/files for ${node.title}`);
     }
 
@@ -263,9 +277,22 @@ async function scrapeOneCourse(
       timeout: 60_000,
     });
     await sleep(2500);
-    await ensureAuth(opts.page, opts.parsed.communityUrl, opts.sessionFile);
+    await ensureAuth(
+      opts.page,
+      opts.parsed.communityUrl,
+      opts.sessionFile,
+      lessonUrl,
+    );
 
-    // Prefer structured Next.js lesson text over noisy DOM chrome
+    if (!opts.page.url().includes(`md=${node.id}`)) {
+      log.warn(
+        `Left lesson page after auth (${opts.page.url()}) — marking partial: ${node.title}`,
+      );
+      markLessonPartial(progress, folderKey, node.id);
+      saveProgress(paths.progress, progress);
+      continue;
+    }
+
     const content =
       (await extractLessonBody(opts.page, node.id)) || node.desc || "";
 
@@ -297,7 +324,6 @@ async function scrapeOneCourse(
             outputPath: outMp4,
             knownPlaybackId: node.videoId,
           });
-          // P0: only mark video complete when MP4 actually landed on disk
           if (ref?.localPath && fs.existsSync(outMp4)) {
             videos.unshift(ref);
             markVideo(progress, videoKey, "complete");
@@ -329,7 +355,6 @@ async function scrapeOneCourse(
       videos.unshift({ source: "mux", playbackId: node.videoId });
     }
 
-    // External hosts (Loom/Vimeo/YouTube/Wistia) via yt-dlp when --videos
     if (opts.videos) {
       const externals = videos.filter(
         (v) =>
@@ -383,7 +408,6 @@ async function scrapeOneCourse(
             preferredName: r.label,
           });
           if (f) files.push(f);
-          // Skool fileId should yield a local file when --files is on
           if (!f?.localPath) {
             log.warn(`File failed for ${node.title}: ${r.fileId}`);
             artifactsOk = false;
@@ -402,7 +426,7 @@ async function scrapeOneCourse(
       }
     }
 
-    const lesson: Lesson = {
+    let lesson: Lesson = {
       type: "lesson",
       id: node.id,
       courseId: course.id,
@@ -418,6 +442,7 @@ async function scrapeOneCourse(
       comments: [],
       extractedAt: new Date().toISOString(),
     };
+    lesson = mergePriorLocalPaths(lesson, lessonJsonPath);
 
     writeLessonJson(lessonJsonPath, lesson);
     fs.writeFileSync(
@@ -437,8 +462,6 @@ async function scrapeOneCourse(
     await jitter(opts.delayMinMs ?? 1200, opts.delayMaxMs ?? 2800);
   }
 
-  // Single-lesson URL: never mark whole course complete.
-  // Otherwise only when every lesson in the full tree succeeded.
   if (!lessonFilter) {
     const allDone = tree.every((node) =>
       isLessonDone(progress, folderKey, node.id),
@@ -502,9 +525,22 @@ async function pullCommunityInner(opts: PullOptions): Promise<void> {
       timeout: 60_000,
     });
     await sleep(4000);
-    await ensureAuth(opts.page, opts.parsed.communityUrl, opts.sessionFile);
+    await ensureAuth(
+      opts.page,
+      opts.parsed.communityUrl,
+      opts.sessionFile,
+      opts.parsed.classroomUrl,
+    );
 
     let courses = await listCourses(opts.page, opts.skipLocked !== false);
+
+    if (courses.length === 0 && !opts.parsed.courseHash && !opts.courseFilter) {
+      throw new Error(
+        `No courses found in classroom for ${opts.parsed.communitySlug}. ` +
+          `Refusing to overwrite courses/index.json (auth wall, rate limit, or empty community).`,
+      );
+    }
+
     writeJson(path.join(paths.courses, "index.json"), {
       courses,
       scrapedAt: new Date().toISOString(),
@@ -553,9 +589,15 @@ async function pullCommunityInner(opts: PullOptions): Promise<void> {
       timeout: 60_000,
     });
     await sleep(4000);
-    await ensureAuth(opts.page, opts.parsed.communityUrl, opts.sessionFile);
+    await ensureAuth(
+      opts.page,
+      opts.parsed.communityUrl,
+      opts.sessionFile,
+      feedUrl,
+    );
 
-    const posts = await extractFeedPosts(opts.page, opts.maxFeedPosts ?? 50);
+    const maxFeed = opts.maxFeedPosts ?? 50;
+    const posts = await extractFeedPosts(opts.page, maxFeed);
     if (opts.comments) {
       for (const post of posts) {
         if (!post.id.startsWith("dom-")) {
@@ -573,14 +615,28 @@ async function pullCommunityInner(opts: PullOptions): Promise<void> {
     }
 
     if (!opts.dryRun) {
-      writeFeedPostsJson(path.join(paths.feed, "posts.json"), {
+      const merged = writeFeedPostsJson(path.join(paths.feed, "posts.json"), {
         posts,
         scrapedAt: new Date().toISOString(),
       });
-      progress.feed.status = "complete";
+      const onlyDom =
+        posts.length > 0 && posts.every((p) => p.id.startsWith("dom-"));
+      const hitCap = posts.length >= maxFeed;
+      // SSR feed is a partial snapshot — don't certify "complete" when we
+      // clearly hit the page-size ceiling or only got DOM stubs.
+      if (onlyDom || hitCap) {
+        progress.feed.status = "pending";
+        log.warn(
+          `Feed archived ${merged.length} post(s) (run=${posts.length}` +
+            `${hitCap ? `, hit --max-feed ${maxFeed}` : ""}` +
+            `${onlyDom ? ", DOM fallback" : ""}) — status left pending`,
+        );
+      } else {
+        progress.feed.status = "complete";
+      }
       saveProgress(paths.progress, progress);
     }
-    log.ok(`Feed posts: ${posts.length}`);
+    log.ok(`Feed posts this run: ${posts.length}`);
   }
 
   log.step(`Done → ${paths.root}`);
@@ -597,6 +653,11 @@ export async function listOnly(opts: {
     timeout: 60_000,
   });
   await sleep(4000);
-  await ensureAuth(opts.page, opts.parsed.communityUrl, opts.sessionFile);
+  await ensureAuth(
+    opts.page,
+    opts.parsed.communityUrl,
+    opts.sessionFile,
+    opts.parsed.classroomUrl,
+  );
   return listCourses(opts.page, opts.skipLocked !== false);
 }
