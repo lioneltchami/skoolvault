@@ -1,0 +1,11 @@
+node_modules/
+dist/
+output/
+.session.json
+*.log
+.DS_Store
+.env
+cookies*.json
+
+# Local upstream clones for study (not vendored)
+references/
