@@ -45,8 +45,11 @@ export function lessonNeedsRework(opts: {
 	externalExpected: { path: string }[];
 	fileIdsWanted: string[];
 	existingFiles?: { fileId?: string; localPath?: string }[];
+	/** Empty body or raw TipTap dump that should be re-extracted as Markdown. */
+	contentNeedsRefresh?: boolean;
 }): boolean {
 	if (!opts.lessonDone) return true;
+	if (opts.contentNeedsRefresh) return true;
 
 	if (opts.videos && opts.muxVideoId) {
 		if (
@@ -69,6 +72,14 @@ export function lessonNeedsRework(opts: {
 		});
 		if (missing) return true;
 	}
+	return false;
+}
+
+/** True when archived lesson body is missing or still raw TipTap JSON. */
+export function contentNeedsRefresh(content?: string): boolean {
+	const t = (content || "").trim();
+	if (t.length < 40) return true;
+	if (t.startsWith("[v2]") || t.startsWith('[{"type"')) return true;
 	return false;
 }
 

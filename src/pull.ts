@@ -12,6 +12,7 @@ import { extractFeedPosts, fetchPostComments } from "./extractors/feed.js";
 import { extractLessonBody } from "./extractors/lesson-content.js";
 import {
   buildExternalExpected,
+  contentNeedsRefresh,
   externalVideoPath,
   lessonNeedsRework,
   mergePriorLocalPaths,
@@ -58,6 +59,7 @@ import {
   waitIfRateLimited,
 } from "./utils/rate-limit.js";
 import { jitter, sanitizeFilename, sleep } from "./utils/text.js";
+import { tipTapToMarkdown } from "./utils/tiptap.js";
 
 export interface PullOptions {
   parsed: ParsedSkoolUrl;
@@ -279,6 +281,7 @@ async function scrapeOneCourse(
       externalExpected,
       fileIdsWanted: wantedFileIds,
       existingFiles: existingLesson?.files,
+      contentNeedsRefresh: contentNeedsRefresh(existingLesson?.content),
     });
 
     if (isLessonDone(progress, folderKey, node.id) && !rework) {
@@ -311,7 +314,12 @@ async function scrapeOneCourse(
     }
 
     const content =
-      (await extractLessonBody(opts.page, node.id)) || node.desc || "";
+      (await extractLessonBody(opts.page, node.id, {
+        group: opts.parsed.communitySlug,
+        courseHash: course.nameHash,
+      })) ||
+      tipTapToMarkdown(node.desc || "") ||
+      "";
 
     // Same corpus for detect + download (desc + live body + resources + videoLink)
     const videoCorpus = [content, node.desc, node.resourcesRaw, node.videoLink]
@@ -616,7 +624,9 @@ async function pullCommunityInner(opts: PullOptions): Promise<void> {
     });
 
     const maxFeed = opts.maxFeedPosts ?? 50;
-    const posts = await extractFeedPosts(opts.page, maxFeed);
+    const posts = await extractFeedPosts(opts.page, maxFeed, {
+      communitySlug: opts.parsed.communitySlug,
+    });
     if (opts.comments) {
       for (const post of posts) {
         if (!post.id.startsWith("dom-")) {

@@ -1,66 +1,89 @@
 import type { Page } from "playwright";
-import { readNextData, renderData } from "../next-data.js";
+import {
+	fetchLessonPageProps,
+	readNextData,
+	renderData,
+} from "../next-data.js";
+import { tipTapToMarkdown } from "../utils/tiptap.js";
+
+type TreeNode = {
+	course?: {
+		id?: string;
+		metadata?: { desc?: string; content?: string; videoLink?: string };
+	};
+	children?: TreeNode[];
+};
+
+function collectFromTree(root: unknown, lessonId: string): string[] {
+	const parts: string[] = [];
+	const walk = (node: TreeNode | undefined) => {
+		if (!node) return;
+		const info = node.course;
+		if (info?.id === lessonId) {
+			const meta = info.metadata || {};
+			if (meta.desc) parts.push(String(meta.desc));
+			if (meta.content) parts.push(String(meta.content));
+		}
+		for (const child of node.children || []) walk(child);
+	};
+	walk(root as TreeNode | undefined);
+	return parts;
+}
+
+function partsFromPageProps(
+	pp: Record<string, unknown> | null | undefined,
+	lessonId: string,
+): string[] {
+	if (!pp) return [];
+	const parts: string[] = [];
+	const rd = (pp.renderData as Record<string, unknown>) || pp;
+	const video = rd.video as { description?: string } | undefined;
+	if (video?.description) parts.push(String(video.description));
+	parts.push(...collectFromTree(rd.course, lessonId));
+	const courseMeta = (
+		pp.course as { metadata?: { desc?: string; content?: string } }
+	)?.metadata;
+	if (courseMeta?.desc) parts.push(String(courseMeta.desc));
+	if (courseMeta?.content) parts.push(String(courseMeta.content));
+	return parts;
+}
 
 /**
- * Prefer structured lesson text from __NEXT_DATA__/renderData over noisy DOM chrome.
- * Falls back to a cleaned MainContent innerText when SSR fields are empty.
+ * Prefer fresh `/_next/data/...json?md=` (current lesson TipTap), then on-page
+ * __NEXT_DATA__, then cleaned DOM. Always normalize TipTap → Markdown.
  */
 export async function extractLessonBody(
 	page: Page,
 	lessonId: string,
+	opts?: { group?: string; courseHash?: string },
 ): Promise<string> {
-	const fromNext = await page.evaluate((id) => {
-		const el = document.querySelector("script#__NEXT_DATA__");
-		if (!el?.textContent) return "";
-		try {
-			const data = JSON.parse(el.textContent) as {
-				props?: {
-					pageProps?: {
-						renderData?: {
-							video?: { description?: string };
-							course?: unknown;
-						};
-						course?: { metadata?: { desc?: string; content?: string } };
-					};
-				};
-			};
-			const pp = data.props?.pageProps;
-			const rd = pp?.renderData;
-			const parts: string[] = [];
+	const parts: string[] = [];
 
-			if (rd?.video?.description) parts.push(String(rd.video.description));
+	if (opts?.group && opts?.courseHash) {
+		const pp = await fetchLessonPageProps(page, {
+			group: opts.group,
+			courseHash: opts.courseHash,
+			moduleId: lessonId,
+		});
+		parts.push(...partsFromPageProps(pp, lessonId));
+	}
 
-			type Node = {
-				course?: {
-					id?: string;
-					metadata?: { desc?: string; content?: string };
-				};
-				children?: Node[];
-			};
+	if (parts.join("").trim().length < 20) {
+		const data = await readNextData(page);
+		const pp = data
+			? ((data.props as { pageProps?: Record<string, unknown> })?.pageProps ??
+				null)
+			: null;
+		parts.push(...partsFromPageProps(pp, lessonId));
+	}
 
-			const walk = (node: Node | undefined) => {
-				if (!node) return;
-				const info = node.course;
-				if (info?.id === id) {
-					const meta = info.metadata || {};
-					if (meta.desc) parts.push(String(meta.desc));
-					if (meta.content) parts.push(String(meta.content));
-				}
-				for (const child of node.children || []) walk(child);
-			};
-			walk(rd?.course as Node | undefined);
+	const fromData = [...new Set(parts.filter(Boolean))]
+		.map((p) => tipTapToMarkdown(p))
+		.filter(Boolean)
+		.join("\n\n")
+		.trim();
 
-			const courseMeta = pp?.course?.metadata;
-			if (courseMeta?.desc) parts.push(String(courseMeta.desc));
-			if (courseMeta?.content) parts.push(String(courseMeta.content));
-
-			return [...new Set(parts.filter(Boolean))].join("\n\n").trim();
-		} catch {
-			return "";
-		}
-	}, lessonId);
-
-	if (fromNext && fromNext.length > 20) return fromNext.slice(0, 50_000);
+	if (fromData.length > 20) return fromData.slice(0, 50_000);
 
 	const fromDom = await page.evaluate(() => {
 		const selectors = [
@@ -68,6 +91,8 @@ export async function extractLessonBody(
 			'[class*="CourseContent"]',
 			'[class*="PostContent"]',
 			'[class*="MainContent"]',
+			'[class*="RichText"]',
+			".ql-editor",
 			"article",
 			"main",
 		];
@@ -79,7 +104,7 @@ export async function extractLessonBody(
 		return "";
 	});
 
-	return fromDom;
+	return tipTapToMarkdown(fromDom || fromData).slice(0, 50_000);
 }
 
 export async function extractLessonVideoLink(
@@ -88,12 +113,8 @@ export async function extractLessonVideoLink(
 ): Promise<string | undefined> {
 	const data = await readNextData(page);
 	const rd = renderData(data);
-	type Node = {
-		course?: { id?: string; metadata?: { videoLink?: string } };
-		children?: Node[];
-	};
 	const found: { link?: string } = {};
-	const walk = (node: Node | undefined) => {
+	const walk = (node: TreeNode | undefined) => {
 		if (!node || found.link) return;
 		if (node.course?.id === lessonId && node.course.metadata?.videoLink) {
 			found.link = node.course.metadata.videoLink;
@@ -101,6 +122,6 @@ export async function extractLessonVideoLink(
 		}
 		for (const child of node.children || []) walk(child);
 	};
-	walk(rd.course as Node | undefined);
+	walk(rd.course as TreeNode | undefined);
 	return found.link;
 }
