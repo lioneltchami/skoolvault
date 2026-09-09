@@ -91,10 +91,9 @@ program
     false,
   )
   .action(async (url: string, opts) => {
-    const preferFeed = Boolean(opts.feed);
-    // Classroom/course/lesson paths keep their kind; --feed only forces feed on bare community URLs.
-    // Feed scrape still runs via opts.feed || parsed.kind === "feed" below.
-    const parsed = parseSkoolUrl(url, preferFeed);
+    // Do NOT pass preferFeed here: `--feed` means "also scrape feed", not
+    // "skip classroom". Feed-only URLs still use ?s|fl|c|p (see url.ts).
+    const parsed = parseSkoolUrl(url);
 
     const outputRoot = path.resolve(opts.out);
     const paths = communityPaths(outputRoot, parsed.communitySlug);

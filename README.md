@@ -81,15 +81,15 @@ A second community → a new sibling folder. Re-runs update the same community f
 ### Useful flags
 
 - `--videos` — Mux HLS → MP4 (ffmpeg); Loom/Vimeo/YouTube/Wistia via yt-dlp when installed
-- `--files` — Skool `api2` signed downloads
-- `--feed` / `--comments` — wall + nested comment graph (`parentId` / `rootId`)
+- `--files` — Skool `api2` signed downloads (re-run after a metadata-only pull will fetch missing attachments)
+- `--feed` / `--comments` — **also** scrape wall + nested comments (does not skip classroom on bare community URLs)
 - `--course <text>` — title filter
 - `--include-locked` — don’t skip VIP courses
 - `--dry-run` — print lesson tree without writing media
 - `--out <dir>` — change archive root (still one folder per community)
 - `--cookies <file>` — Cookie-Editor JSON (needs `auth_token`)
 
-On HTTP 429/403 from Skool/Mux, pulls automatically back off before the next navigation.
+On HTTP 429 (and API/Mux 403), pulls automatically back off before the next navigation. Progress writes are atomic; corrupted `progress.json` resets safely.
 
 Session cookies are stored at `output/.session.json` and reused across communities.
 

@@ -51,7 +51,9 @@ export function ensureCommunityLayout(paths: CommunityPaths): void {
 
 export function writeJson(file: string, data: unknown): void {
 	fs.mkdirSync(path.dirname(file), { recursive: true });
-	fs.writeFileSync(file, JSON.stringify(data, null, 2), "utf8");
+	const tmp = `${file}.tmp`;
+	fs.writeFileSync(tmp, JSON.stringify(data, null, 2), "utf8");
+	fs.renameSync(tmp, file);
 }
 
 /** Validate with Zod then write — throws ZodError on bad shapes. */
@@ -88,7 +90,22 @@ export function writeCommunityMetaValidated(
 
 export function readJson<T>(file: string): T | null {
 	if (!fs.existsSync(file)) return null;
-	return JSON.parse(fs.readFileSync(file, "utf8")) as T;
+	try {
+		return JSON.parse(fs.readFileSync(file, "utf8")) as T;
+	} catch {
+		return null;
+	}
+}
+
+/** Stable on-disk course folder — avoid title-slug collisions across courses. */
+export function courseFolderKey(course: {
+	slug: string;
+	nameHash: string;
+	id: string;
+}): string {
+	const unique = (course.nameHash || course.id || "").slice(0, 10);
+	if (!unique || unique.startsWith("dom-")) return course.slug;
+	return `${course.slug}--${unique}`;
 }
 
 export function courseDir(paths: CommunityPaths, courseSlug: string): string {

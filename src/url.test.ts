@@ -46,9 +46,17 @@ check("?p= → feed", () => {
   assert.equal(p.kind, "feed");
 });
 
-check("preferFeed bare → feed", () => {
-  const p = parseSkoolUrl("https://www.skool.com/my-group", true);
-  assert.equal(p.kind, "feed");
+check(
+  "preferFeed bare → feed (API helper; CLI --feed does not use this)",
+  () => {
+    const p = parseSkoolUrl("https://www.skool.com/my-group", true);
+    assert.equal(p.kind, "feed");
+  },
+);
+
+check("bare community without preferFeed → community (classroom)", () => {
+  const p = parseSkoolUrl("https://www.skool.com/my-group", false);
+  assert.equal(p.kind, "community");
 });
 
 check("classroom path ignores feed query noise", () => {

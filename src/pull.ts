@@ -32,9 +32,11 @@ import {
 import type { Course, Lesson } from "./schema.js";
 import {
   communityPaths,
+  courseFolderKey,
   ensureCommunityLayout,
   ensureCourseLayout,
   lessonBasename,
+  readJson,
   writeCommunityMeta,
   writeFeedPostsJson,
   writeJson,
@@ -171,7 +173,8 @@ async function scrapeOneCourse(
   progress: ProgressState,
   paths: ReturnType<typeof communityPaths>,
 ): Promise<void> {
-  const layout = ensureCourseLayout(paths, course.slug);
+  const folderKey = courseFolderKey(course);
+  const layout = ensureCourseLayout(paths, folderKey);
   writeJson(layout.courseJson, {
     ...course,
     scrapedAt: new Date().toISOString(),
@@ -220,20 +223,37 @@ async function scrapeOneCourse(
 
     const base = lessonBasename(node.position, node.title);
     const outMp4 = path.join(layout.media, `${base}.mp4`);
-    const videoKey = `${course.slug}:${node.id}`;
+    const videoKey = `${folderKey}:${node.id}`;
+    const lessonJsonPath = path.join(layout.lessons, `${base}.json`);
 
-    // Resume: skip only when lesson complete AND requested video ok on disk.
-    // Repair falsely-complete lessons missing MP4 or marked video-failed.
-    if (isLessonDone(progress, course.slug, node.id)) {
+    // Resume: skip only when lesson complete AND requested artifacts ok on disk.
+    if (isLessonDone(progress, folderKey, node.id)) {
       const needsVideoRepair =
         Boolean(opts.videos) &&
         Boolean(node.videoId) &&
         (isVideoFailed(progress, videoKey) || !fs.existsSync(outMp4));
-      if (!needsVideoRepair) {
+
+      let needsFileRepair = false;
+      if (opts.files) {
+        const wantedIds = parseResources(node.resourcesRaw)
+          .map((r) => r.fileId)
+          .filter((id): id is string => Boolean(id));
+        if (wantedIds.length) {
+          const existing = readJson<{
+            files?: { fileId?: string; localPath?: string }[];
+          }>(lessonJsonPath);
+          needsFileRepair = wantedIds.some((id) => {
+            const f = existing?.files?.find((x) => x.fileId === id);
+            return !f?.localPath || !fs.existsSync(f.localPath);
+          });
+        }
+      }
+
+      if (!needsVideoRepair && !needsFileRepair) {
         log.skip(`${node.title}`);
         continue;
       }
-      log.info(`Retry media for ${node.title}`);
+      log.info(`Retry media/files for ${node.title}`);
     }
 
     const lessonUrl = `${opts.parsed.communityUrl}/classroom/${course.nameHash}?md=${node.id}`;
@@ -277,11 +297,16 @@ async function scrapeOneCourse(
             outputPath: outMp4,
             knownPlaybackId: node.videoId,
           });
-          if (ref) {
+          // P0: only mark video complete when MP4 actually landed on disk
+          if (ref?.localPath && fs.existsSync(outMp4)) {
             videos.unshift(ref);
             markVideo(progress, videoKey, "complete");
           } else {
-            log.warn(`Video missing for ${node.title} (no Mux result)`);
+            if (ref) videos.unshift(ref);
+            else if (node.videoId) {
+              videos.unshift({ source: "mux", playbackId: node.videoId });
+            }
+            log.warn(`Video missing for ${node.title} (no Mux download)`);
             markVideo(progress, videoKey, "failed");
             artifactsOk = false;
           }
@@ -314,7 +339,7 @@ async function scrapeOneCourse(
       );
       for (let i = 0; i < externals.length; i++) {
         const v = externals[i]!;
-        const extKey = `${course.slug}:${node.id}:ext:${v.source}:${i}`;
+        const extKey = `${folderKey}:${node.id}:ext:${v.source}:${i}`;
         const extPath = path.join(
           layout.media,
           `${base}-${v.source}-${i + 1}.mp4`,
@@ -394,17 +419,17 @@ async function scrapeOneCourse(
       extractedAt: new Date().toISOString(),
     };
 
-    writeLessonJson(path.join(layout.lessons, `${base}.json`), lesson);
+    writeLessonJson(lessonJsonPath, lesson);
     fs.writeFileSync(
       path.join(layout.lessons, `${base}.md`),
       lessonToMarkdown(lesson),
       "utf8",
     );
     if (artifactsOk) {
-      markLessonDone(progress, course.slug, node.id);
+      markLessonDone(progress, folderKey, node.id);
       log.ok(`Lesson ${node.position}: ${node.title}`);
     } else {
-      markLessonPartial(progress, course.slug, node.id);
+      markLessonPartial(progress, folderKey, node.id);
       log.warn(`Lesson partial ${node.position}: ${node.title}`);
     }
     saveProgress(paths.progress, progress);
@@ -416,10 +441,10 @@ async function scrapeOneCourse(
   // Otherwise only when every lesson in the full tree succeeded.
   if (!lessonFilter) {
     const allDone = tree.every((node) =>
-      isLessonDone(progress, course.slug, node.id),
+      isLessonDone(progress, folderKey, node.id),
     );
     if (allDone) {
-      markCourseDone(progress, course.slug);
+      markCourseDone(progress, folderKey);
       saveProgress(paths.progress, progress);
     }
   }

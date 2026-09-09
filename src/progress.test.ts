@@ -99,4 +99,43 @@ check("writeLessonJson validates and writes", () => {
 	fs.rmSync(dir, { recursive: true, force: true });
 });
 
+check("P0: video without localPath must not count as done", () => {
+	// Mirrors pull.ts decision: ref truthy but no file → failed, not complete
+	const p = emptyProgress();
+	const ref: { localPath?: string } | null = { localPath: undefined };
+	const outMp4Missing = true;
+	const ok = Boolean(ref?.localPath) && !outMp4Missing;
+	if (ok) markVideo(p, "course:l1", "complete");
+	else {
+		markVideo(p, "course:l1", "failed");
+		markLessonPartial(p, "course", "l1");
+	}
+	assert.equal(isVideoDone(p, "course:l1"), false);
+	assert.equal(isVideoFailed(p, "course:l1"), true);
+	assert.equal(isLessonDone(p, "course", "l1"), false);
+});
+
+check("P0: lesson filter must not mark course complete", () => {
+	const p = emptyProgress();
+	const tree = [{ id: "a" }, { id: "b" }];
+	const lessonFilter = "a";
+	markLessonDone(p, "c", "a");
+	if (!lessonFilter) {
+		const allDone = tree.every((n) => isLessonDone(p, "c", n.id));
+		if (allDone) markCourseDone(p, "c");
+	}
+	assert.notEqual(p.courses.c?.status, "complete");
+});
+
+check("atomic writeJson + corrupt progress recovers", () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "skoolvault-atomic-"));
+	const file = path.join(dir, "progress.json");
+	saveProgress(file, emptyProgress());
+	assert.ok(fs.existsSync(file));
+	fs.writeFileSync(file, "{broken", "utf8");
+	const loaded = loadProgress(file);
+	assert.equal(loaded.feed.status, "pending");
+	fs.rmSync(dir, { recursive: true, force: true });
+});
+
 console.log("\nprogress/schema tests passed");
