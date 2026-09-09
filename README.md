@@ -9,7 +9,8 @@ Lean build inspired by open scrapers (rcspence1, OpenCnid) plus product lessons 
 ## Requirements
 
 - Node.js 18+
-- [ffmpeg](https://ffmpeg.org/) (for `--videos`)
+- [ffmpeg](https://ffmpeg.org/) (for Mux/`--videos`)
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) (optional; Loom/Vimeo/YouTube/Wistia when `--videos`)
 - Chromium via Playwright (`npx playwright install chromium`)
 
 ## Quick start
@@ -79,7 +80,7 @@ A second community → a new sibling folder. Re-runs update the same community f
 
 ### Useful flags
 
-- `--videos` — Mux/Skool HLS → MP4 via ffmpeg
+- `--videos` — Mux HLS → MP4 (ffmpeg); Loom/Vimeo/YouTube/Wistia via yt-dlp when installed
 - `--files` — Skool `api2` signed downloads
 - `--feed` / `--comments` — wall + nested comment graph (`parentId` / `rootId`)
 - `--course <text>` — title filter
@@ -87,6 +88,8 @@ A second community → a new sibling folder. Re-runs update the same community f
 - `--dry-run` — print lesson tree without writing media
 - `--out <dir>` — change archive root (still one folder per community)
 - `--cookies <file>` — Cookie-Editor JSON (needs `auth_token`)
+
+On HTTP 429/403 from Skool/Mux, pulls automatically back off before the next navigation.
 
 Session cookies are stored at `output/.session.json` and reused across communities.
 

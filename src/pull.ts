@@ -3,17 +3,20 @@ import path from "node:path";
 import type { Page } from "playwright";
 import { ensureAuth } from "./auth.js";
 import {
+  clickCourseFromIndex,
   extractCourseLessonTree,
   listCourses,
   parseResources,
 } from "./extractors/classroom.js";
 import { extractFeedPosts, fetchPostComments } from "./extractors/feed.js";
+import { extractLessonBody } from "./extractors/lesson-content.js";
 import { downloadSkoolFile } from "./media/files.js";
 import {
   assertFfmpegAvailable,
   detectExternalVideoUrls,
   resolveAndDownloadMux,
 } from "./media/mux.js";
+import { downloadExternalVideo, hasYtDlp } from "./media/ytdlp.js";
 import {
   isLessonDone,
   isVideoDone,
@@ -33,10 +36,18 @@ import {
   ensureCourseLayout,
   lessonBasename,
   writeCommunityMeta,
+  writeFeedPostsJson,
   writeJson,
+  writeLessonJson,
 } from "./storage.js";
 import type { ParsedSkoolUrl } from "./url.js";
 import { log } from "./utils/log.js";
+import {
+  attachRateLimitWatcher,
+  createRateLimitState,
+  type RateLimitState,
+  waitIfRateLimited,
+} from "./utils/rate-limit.js";
 import { jitter, sanitizeFilename, sleep } from "./utils/text.js";
 
 export interface PullOptions {
@@ -54,6 +65,7 @@ export interface PullOptions {
   delayMinMs?: number;
   delayMaxMs?: number;
   dryRun?: boolean;
+  rateLimit?: RateLimitState;
 }
 
 function lessonToMarkdown(lesson: Lesson): string {
@@ -121,7 +133,20 @@ async function loadCoursePage(
   communityUrl: string,
   course: Course,
 ): Promise<boolean> {
-  if (!course.nameHash) return false;
+  if (!course.nameHash) {
+    // DOM-only courses: try click-from-index by title
+    log.warn(
+      `No nameHash for "${course.title}" — trying classroom click fallback`,
+    );
+    const clicked = await clickCourseFromIndex(
+      page,
+      communityUrl,
+      course.title,
+    );
+    if (!clicked) return false;
+    return courseTreeLoaded(page);
+  }
+
   const url = `${communityUrl}/classroom/${course.nameHash}`;
   await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
   await sleep(3500);
@@ -131,6 +156,12 @@ async function loadCoursePage(
   // Soft reload once to refresh SSR payload after client nav
   await page.reload({ waitUntil: "domcontentloaded" });
   await sleep(3000);
+  if (await courseTreeLoaded(page)) return true;
+
+  // Click-from-index fallback (paginated classroom)
+  log.warn(`Direct URL failed for "${course.title}" — trying click-from-index`);
+  const clicked = await clickCourseFromIndex(page, communityUrl, course.title);
+  if (!clicked) return false;
   return courseTreeLoaded(page);
 }
 
@@ -157,6 +188,10 @@ async function scrapeOneCourse(
     );
     return;
   }
+  // Click-from-index / DOM-only courses: recover nameHash from the live URL
+  const hashFromUrl = opts.page.url().match(/\/classroom\/([^/?#]+)/)?.[1];
+  if (hashFromUrl) course.nameHash = hashFromUrl;
+
   await ensureAuth(opts.page, opts.parsed.communityUrl, opts.sessionFile);
 
   const tree = await extractCourseLessonTree(opts.page);
@@ -202,6 +237,7 @@ async function scrapeOneCourse(
     }
 
     const lessonUrl = `${opts.parsed.communityUrl}/classroom/${course.nameHash}?md=${node.id}`;
+    if (opts.rateLimit) await waitIfRateLimited(opts.rateLimit);
     await opts.page.goto(lessonUrl, {
       waitUntil: "domcontentloaded",
       timeout: 60_000,
@@ -209,18 +245,19 @@ async function scrapeOneCourse(
     await sleep(2500);
     await ensureAuth(opts.page, opts.parsed.communityUrl, opts.sessionFile);
 
-    // Prefer content from current page body
-    const content = await opts.page.evaluate(() => {
-      const main =
-        document.querySelector('[class*="MainContent"]') ||
-        document.querySelector('[class*="LessonContent"]') ||
-        document.querySelector("main");
-      return main?.textContent?.trim().slice(0, 50_000) || "";
-    });
+    // Prefer structured Next.js lesson text over noisy DOM chrome
+    const content =
+      (await extractLessonBody(opts.page, node.id)) || node.desc || "";
 
     const videos = detectExternalVideoUrls(
-      content + " " + (node.resourcesRaw || ""),
+      content + " " + (node.resourcesRaw || "") + " " + (node.videoLink || ""),
     );
+    if (node.videoLink) {
+      const fromMeta = detectExternalVideoUrls(node.videoLink);
+      for (const v of fromMeta) {
+        if (!videos.some((x) => x.url === v.url)) videos.push(v);
+      }
+    }
     const resources = parseResources(node.resourcesRaw);
     const files = [];
     let artifactsOk = true;
@@ -265,6 +302,49 @@ async function scrapeOneCourse(
       }
     } else if (node.videoId) {
       videos.unshift({ source: "mux", playbackId: node.videoId });
+    }
+
+    // External hosts (Loom/Vimeo/YouTube/Wistia) via yt-dlp when --videos
+    if (opts.videos) {
+      const externals = videos.filter(
+        (v) =>
+          v.url &&
+          v.source !== "mux" &&
+          ["loom", "vimeo", "youtube", "wistia"].includes(v.source),
+      );
+      for (let i = 0; i < externals.length; i++) {
+        const v = externals[i]!;
+        const extKey = `${course.slug}:${node.id}:ext:${v.source}:${i}`;
+        const extPath = path.join(
+          layout.media,
+          `${base}-${v.source}-${i + 1}.mp4`,
+        );
+        if (isVideoDone(progress, extKey) && fs.existsSync(extPath)) {
+          v.localPath = extPath;
+          continue;
+        }
+        if (!hasYtDlp()) {
+          log.warn(`Skipping ${v.source} download (yt-dlp missing): ${v.url}`);
+          artifactsOk = false;
+          continue;
+        }
+        try {
+          if (opts.rateLimit) await waitIfRateLimited(opts.rateLimit);
+          const ref = await downloadExternalVideo({
+            url: v.url!,
+            outputPath: extPath,
+            source: v.source,
+          });
+          Object.assign(v, ref);
+          markVideo(progress, extKey, "complete");
+        } catch (e) {
+          log.warn(
+            `External ${v.source} failed: ${e instanceof Error ? e.message : e}`,
+          );
+          markVideo(progress, extKey, "failed");
+          artifactsOk = false;
+        }
+      }
     }
 
     if (opts.files) {
@@ -314,7 +394,7 @@ async function scrapeOneCourse(
       extractedAt: new Date().toISOString(),
     };
 
-    writeJson(path.join(layout.lessons, `${base}.json`), lesson);
+    writeLessonJson(path.join(layout.lessons, `${base}.json`), lesson);
     fs.writeFileSync(
       path.join(layout.lessons, `${base}.md`),
       lessonToMarkdown(lesson),
@@ -349,8 +429,26 @@ export async function pullCommunity(opts: PullOptions): Promise<void> {
   // Fail fast before browser work when --videos needs ffmpeg
   if (opts.videos && !opts.dryRun) {
     assertFfmpegAvailable();
+    // yt-dlp optional but recommended; warn once if missing (Mux still works)
+    if (!hasYtDlp()) {
+      log.warn(
+        "yt-dlp not found — Loom/Vimeo/YouTube/Wistia downloads will be skipped (Mux still works). Install: brew install yt-dlp",
+      );
+    }
   }
 
+  const rateLimit = opts.rateLimit ?? createRateLimitState();
+  const detachRateLimit = attachRateLimitWatcher(opts.page, rateLimit);
+  opts.rateLimit = rateLimit;
+
+  try {
+    await pullCommunityInner(opts);
+  } finally {
+    detachRateLimit();
+  }
+}
+
+async function pullCommunityInner(opts: PullOptions): Promise<void> {
   const paths = communityPaths(opts.outputRoot, opts.parsed.communitySlug);
   ensureCommunityLayout(paths);
   // Keep session next to output root for reuse across communities
@@ -373,6 +471,7 @@ export async function pullCommunity(opts: PullOptions): Promise<void> {
 
   if (doClassroom) {
     log.step(`Classroom → ${opts.parsed.classroomUrl}`);
+    if (opts.rateLimit) await waitIfRateLimited(opts.rateLimit);
     await opts.page.goto(opts.parsed.classroomUrl, {
       waitUntil: "domcontentloaded",
       timeout: 60_000,
@@ -413,6 +512,7 @@ export async function pullCommunity(opts: PullOptions): Promise<void> {
 
     for (const course of courses) {
       log.step(`Course: ${course.title}`);
+      if (opts.rateLimit) await waitIfRateLimited(opts.rateLimit);
       await scrapeOneCourse(opts, course, progress, paths);
     }
   }
@@ -422,6 +522,7 @@ export async function pullCommunity(opts: PullOptions): Promise<void> {
     const feedUrl = opts.parsed.feedQuery
       ? `${opts.parsed.communityUrl}${opts.parsed.feedQuery}`
       : opts.parsed.communityUrl;
+    if (opts.rateLimit) await waitIfRateLimited(opts.rateLimit);
     await opts.page.goto(feedUrl, {
       waitUntil: "domcontentloaded",
       timeout: 60_000,
@@ -434,6 +535,7 @@ export async function pullCommunity(opts: PullOptions): Promise<void> {
       for (const post of posts) {
         if (!post.id.startsWith("dom-")) {
           try {
+            if (opts.rateLimit) await waitIfRateLimited(opts.rateLimit);
             post.comments = await fetchPostComments(opts.page, post.id);
             await jitter(800, 1600);
           } catch (e) {
@@ -446,7 +548,7 @@ export async function pullCommunity(opts: PullOptions): Promise<void> {
     }
 
     if (!opts.dryRun) {
-      writeJson(path.join(paths.feed, "posts.json"), {
+      writeFeedPostsJson(path.join(paths.feed, "posts.json"), {
         posts,
         scrapedAt: new Date().toISOString(),
       });

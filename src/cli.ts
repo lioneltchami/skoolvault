@@ -74,7 +74,11 @@ program
     "Run browser headless (requires valid session/cookies)",
     false,
   )
-  .option("--videos", "Download Mux/Skool videos as MP4", false)
+  .option(
+    "--videos",
+    "Download Mux (ffmpeg) + Loom/Vimeo/YouTube/Wistia (yt-dlp) as MP4",
+    false,
+  )
   .option("--files", "Download Skool file attachments", false)
   .option("--feed", "Also scrape the community feed (or use a feed URL)", false)
   .option("--comments", "Fetch comment threads for feed posts", false)

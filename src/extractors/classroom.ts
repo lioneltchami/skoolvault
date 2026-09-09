@@ -1,7 +1,7 @@
 import type { Page } from "playwright";
 import { pageProps, readNextData, renderData } from "../next-data.js";
 import type { Course } from "../schema.js";
-import { slugify } from "../utils/text.js";
+import { sleep, slugify } from "../utils/text.js";
 
 interface RawCourse {
 	id?: string;
@@ -18,76 +18,113 @@ interface RawCourse {
 	};
 }
 
-export async function listCourses(
-	page: Page,
-	skipLocked = true,
-): Promise<Course[]> {
-	const data = await readNextData(page);
-	const rd = renderData(data);
-	const pp = pageProps(data);
-	const allCourses = (rd.allCourses || pp.allCourses || []) as RawCourse[];
+function mapRawCourse(c: RawCourse, i: number, domTitle?: string): Course {
+	const hasAccess =
+		c.metadata?.hasAccess === undefined ? true : c.metadata.hasAccess === 1;
+	const title = c.metadata?.title || domTitle || c.name || `Course ${i + 1}`;
+	const nameHash = c.name || c.rootId || c.id || `course-${i}`;
+	return {
+		id: c.id || nameHash,
+		nameHash,
+		title,
+		slug: slugify(title),
+		description: c.metadata?.desc || "",
+		numModules: c.metadata?.numModules || 0,
+		hasAccess,
+	};
+}
 
-	const domTitles = await page.evaluate(() =>
+async function readDomTitles(page: Page): Promise<string[]> {
+	return page.evaluate(() =>
 		Array.from(document.querySelectorAll('[class*="CourseTitle"]')).map(
 			(el) => el.textContent?.trim() || "",
 		),
 	);
+}
 
-	const courses: Course[] = [];
-	for (let i = 0; i < allCourses.length; i++) {
-		const c = allCourses[i]!;
-		const hasAccess =
-			c.metadata?.hasAccess === undefined ? true : c.metadata.hasAccess === 1;
-		if (skipLocked && !hasAccess) continue;
-
-		const title =
-			c.metadata?.title || domTitles[i] || c.name || `Course ${i + 1}`;
-		const nameHash = c.name || c.rootId || c.id || `course-${i}`;
-		courses.push({
-			id: c.id || nameHash,
-			nameHash,
-			title,
-			slug: slugify(title),
-			description: c.metadata?.desc || "",
-			numModules: c.metadata?.numModules || 0,
-			hasAccess,
-		});
-	}
-
-	// DOM fallback
-	if (courses.length === 0) {
-		const fromDom = await page.evaluate(() => {
-			const out: { title: string; description: string; index: number }[] = [];
-			const wrappers = document.querySelectorAll(
-				'[class*="CourseLinkWrapper"], [class*="CourseWrapper"]',
-			);
-			wrappers.forEach((wrapper, i) => {
-				const title =
-					wrapper
-						.querySelector('[class*="CourseTitle"]')
-						?.textContent?.trim() || `Course ${i + 1}`;
-				const description =
-					wrapper
-						.querySelector('[class*="CourseDescription"]')
-						?.textContent?.trim() || "";
-				out.push({ title, description, index: i });
-			});
-			return out;
-		});
-		for (const c of fromDom) {
-			courses.push({
-				id: `dom-${c.index}`,
-				nameHash: "",
-				title: c.title,
-				slug: slugify(c.title),
-				description: c.description,
-				numModules: 0,
-				hasAccess: true,
-			});
+async function clickClassroomNext(page: Page): Promise<boolean> {
+	return page.evaluate(() => {
+		const nextBtn = document.querySelector(
+			'[class*="Pagination"] button:last-child, [aria-label="Next"], button[aria-label*="Next"]',
+		) as HTMLButtonElement | null;
+		if (nextBtn && !nextBtn.disabled) {
+			nextBtn.click();
+			return true;
 		}
+		return false;
+	});
+}
+
+/**
+ * List courses from classroom page. Paginates up to 5 pages (DOM + merging
+ * __NEXT_DATA__ allCourses) so large classrooms are not truncated.
+ */
+export async function listCourses(
+	page: Page,
+	skipLocked = true,
+): Promise<Course[]> {
+	const byId = new Map<string, Course>();
+
+	const ingest = async () => {
+		const data = await readNextData(page);
+		const rd = renderData(data);
+		const pp = pageProps(data);
+		const allCourses = (rd.allCourses || pp.allCourses || []) as RawCourse[];
+		const domTitles = await readDomTitles(page);
+
+		for (let i = 0; i < allCourses.length; i++) {
+			const c = allCourses[i]!;
+			const mapped = mapRawCourse(c, i, domTitles[i]);
+			if (skipLocked && !mapped.hasAccess) continue;
+			byId.set(mapped.id, mapped);
+		}
+
+		if (allCourses.length === 0) {
+			const fromDom = await page.evaluate(() => {
+				const out: { title: string; description: string; index: number }[] = [];
+				const wrappers = document.querySelectorAll(
+					'[class*="CourseLinkWrapper"], [class*="CourseWrapper"]',
+				);
+				wrappers.forEach((wrapper, i) => {
+					const title =
+						wrapper
+							.querySelector('[class*="CourseTitle"]')
+							?.textContent?.trim() || `Course ${i + 1}`;
+					const description =
+						wrapper
+							.querySelector('[class*="CourseDescription"]')
+							?.textContent?.trim() || "";
+					out.push({ title, description, index: i });
+				});
+				return out;
+			});
+			for (const c of fromDom) {
+				const id = `dom-${c.title}`;
+				if (byId.has(id)) continue;
+				byId.set(id, {
+					id,
+					nameHash: "",
+					title: c.title,
+					slug: slugify(c.title),
+					description: c.description,
+					numModules: 0,
+					hasAccess: true,
+				});
+			}
+		}
+	};
+
+	await ingest();
+
+	// Paginate classroom index (Skool may split courses across pages)
+	for (let pageNum = 0; pageNum < 5; pageNum++) {
+		const moved = await clickClassroomNext(page);
+		if (!moved) break;
+		await sleep(2500);
+		await ingest();
 	}
 
-	return courses;
+	return [...byId.values()];
 }
 
 export interface TreeLesson {
@@ -96,8 +133,10 @@ export interface TreeLesson {
 	title: string;
 	section: string;
 	videoId?: string;
+	videoLink?: string;
 	position: number;
 	resourcesRaw?: string;
+	desc?: string;
 }
 
 interface TreeNode {
@@ -108,14 +147,17 @@ interface TreeNode {
 		metadata?: {
 			title?: string;
 			videoId?: string;
+			videoLink?: string;
 			resources?: string;
 			desc?: string;
+			content?: string;
 		};
 	};
 	children?: TreeNode[];
 }
 
-function walkTree(
+/** Exported for unit tests — walk Skool course.children tree into flat lessons. */
+export function walkTree(
 	node: TreeNode,
 	path: string[],
 	out: TreeLesson[],
@@ -134,8 +176,10 @@ function walkTree(
 			title: title || `Lesson ${counter.n}`,
 			section: path.length ? path[path.length - 1]! : "",
 			videoId: meta.videoId,
+			videoLink: meta.videoLink,
 			position: counter.n,
 			resourcesRaw: meta.resources,
+			desc: meta.desc || meta.content,
 		});
 	}
 
@@ -192,4 +236,54 @@ export function parseResources(
 		// ignore
 	}
 	return [];
+}
+
+/** Click a course card from the classroom index across up to 5 pages. */
+export async function clickCourseFromIndex(
+	page: Page,
+	communityUrl: string,
+	courseTitle: string,
+): Promise<boolean> {
+	await page.goto(`${communityUrl}/classroom`, {
+		waitUntil: "domcontentloaded",
+		timeout: 60_000,
+	});
+	await sleep(3000);
+
+	for (let pageNum = 0; pageNum < 5; pageNum++) {
+		const clicked = await page.evaluate((title) => {
+			const wrappers = document.querySelectorAll(
+				'[class*="CourseLinkWrapper"], [class*="CourseWrapper"]',
+			);
+			for (const w of wrappers) {
+				const titleEl = w.querySelector('[class*="CourseTitle"]');
+				if (titleEl && titleEl.textContent?.trim() === title) {
+					(w as HTMLElement).click();
+					return true;
+				}
+			}
+			return false;
+		}, courseTitle);
+
+		if (clicked) {
+			try {
+				await page.waitForURL(/\/classroom\//, { timeout: 10_000 });
+			} catch {
+				// may already be on course URL
+			}
+			await sleep(2500);
+			const url = page.url();
+			if (url.includes("/classroom/") && !url.endsWith("/classroom")) {
+				await page.reload({ waitUntil: "domcontentloaded" });
+				await sleep(3000);
+			}
+			return true;
+		}
+
+		const hasNext = await clickClassroomNext(page);
+		if (!hasNext) break;
+		await sleep(2500);
+	}
+
+	return false;
 }
