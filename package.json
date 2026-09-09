@@ -17,7 +17,8 @@
     "test:resume": "tsx src/lesson-resume.test.ts",
     "test:files": "tsx src/media/files.test.ts",
     "test:tiptap": "tsx src/tiptap.test.ts",
-    "test": "npm run test:url && npm run test:classroom && npm run test:progress && npm run test:resume && npm run test:files && npm run test:tiptap",
+    "test:feed-sort": "tsx src/feed-sort.test.ts",
+    "test": "npm run test:url && npm run test:classroom && npm run test:progress && npm run test:resume && npm run test:files && npm run test:tiptap && npm run test:feed-sort",
     "postinstall": "playwright install chromium"
   },
   "engines": {

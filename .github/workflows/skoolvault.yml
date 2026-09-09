@@ -5,11 +5,13 @@
 #                   Must include auth_token for skool.com
 #
 # Fill in when running (Actions → SkoolVault archive → Run workflow):
-#   community — slug only, e.g. ai-first-client-formula-8589
+#   community — one slug, or several comma-separated:
+#     ai-first-client-formula-8589
+#     slug-one, slug-two, slug-three
 #   then toggle videos / files / comments / course filter as you like
 #
-# Always archives classroom + community feed into output/<slug>/,
-# then uploads artifact skoolvault-<slug>.
+# Always archives classroom + community feed into output/<slug>/ per community,
+# then uploads artifact skoolvault-archive (sibling folders inside).
 #
 # Local equivalent (same slug works — no need for full URL):
 #   npm run skoolvault -- pull ai-first-client-formula-8589 --feed --videos --files --comments
@@ -20,7 +22,7 @@ on:
   workflow_dispatch:
     inputs:
       community:
-        description: "Community slug only (e.g. ai-first-client-formula-8589)"
+        description: "Slug(s) only — one, or comma-separated (e.g. group-a, group-b)"
         required: true
         type: string
       videos:
@@ -44,10 +46,10 @@ on:
         type: string
         default: ""
       max_feed:
-        description: "Max feed posts to archive (integer)"
+        description: "Keep N most recent community posts (newest first)"
         required: false
         type: string
-        default: "50"
+        default: "100"
 
 permissions:
   contents: read
@@ -103,38 +105,51 @@ jobs:
             console.log('Cookies OK (' + cookies.length + ' entries, auth_token present)');
           "
 
-      - name: Normalize community slug
+      - name: Normalize community slug(s)
         id: slug
         env:
           RAW: ${{ inputs.community }}
           MAX_FEED: ${{ inputs.max_feed }}
         run: |
           set -euo pipefail
-          # Accept slug, path, or full URL — keep first path segment only
-          SLUG="$RAW"
-          SLUG="${SLUG#https://www.skool.com/}"
-          SLUG="${SLUG#http://www.skool.com/}"
-          SLUG="${SLUG#https://skool.com/}"
-          SLUG="${SLUG#http://skool.com/}"
-          SLUG="${SLUG%%\?*}"
-          SLUG="${SLUG%%/*}"
-          SLUG="$(printf '%s' "$SLUG" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
-          if ! printf '%s' "$SLUG" | grep -Eq '^[a-z0-9][a-z0-9_-]*$'; then
-            echo "::error::Bad community slug: '$RAW' → '$SLUG' (use e.g. ai-first-client-formula-8589)"
-            exit 1
-          fi
-          MF="${MAX_FEED:-50}"
+          MF="${MAX_FEED:-100}"
           if ! printf '%s' "$MF" | grep -Eq '^[0-9]+$'; then
             echo "::error::max_feed must be a non-negative integer (got '$MF')"
             exit 1
           fi
-          echo "slug=$SLUG" >> "$GITHUB_OUTPUT"
           echo "max_feed=$MF" >> "$GITHUB_OUTPUT"
-          echo "Community: $SLUG (classroom + community feed, max_feed=$MF)"
+
+          # Comma-separated slugs (or URLs) → one valid slug per line in slugs.txt
+          : > slugs.txt
+          COUNT=0
+          IFS=',' read -ra PARTS <<< "$RAW"
+          for PART in "${PARTS[@]}"; do
+            SLUG="$(printf '%s' "$PART" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            [ -z "$SLUG" ] && continue
+            SLUG="${SLUG#https://www.skool.com/}"
+            SLUG="${SLUG#http://www.skool.com/}"
+            SLUG="${SLUG#https://skool.com/}"
+            SLUG="${SLUG#http://skool.com/}"
+            SLUG="${SLUG%%\?*}"
+            SLUG="${SLUG%%/*}"
+            SLUG="$(printf '%s' "$SLUG" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+            if ! printf '%s' "$SLUG" | grep -Eq '^[a-z0-9][a-z0-9_-]*$'; then
+              echo "::error::Bad community slug: '$PART' → '$SLUG'"
+              exit 1
+            fi
+            echo "$SLUG" >> slugs.txt
+            COUNT=$((COUNT + 1))
+            echo "Community: $SLUG"
+          done
+          if [ "$COUNT" -lt 1 ]; then
+            echo "::error::No community slugs in: '$RAW'"
+            exit 1
+          fi
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "Parsed $COUNT community(ies), max_feed=$MF"
 
       - name: Pull classroom + community feed
         env:
-          SLUG: ${{ steps.slug.outputs.slug }}
           COURSE: ${{ inputs.course }}
           MAX_FEED: ${{ steps.slug.outputs.max_feed }}
           DO_VIDEOS: ${{ inputs.videos }}
@@ -142,23 +157,29 @@ jobs:
           DO_COMMENTS: ${{ inputs.comments }}
         run: |
           set -euo pipefail
-          # Bare slug → classroom + --feed (community wall). Same as local CLI.
-          ARGS=(pull "$SLUG" --out output --cookies cookies.json --headless --feed --max-feed "$MAX_FEED")
-          if [ "$DO_VIDEOS" = "true" ]; then ARGS+=(--videos); fi
-          if [ "$DO_FILES" = "true" ]; then ARGS+=(--files); fi
-          if [ "$DO_COMMENTS" = "true" ]; then ARGS+=(--comments); fi
-          if [ -n "${COURSE// }" ]; then ARGS+=(--course "$COURSE"); fi
-          echo "Running: npm run skoolvault -- ${ARGS[*]}"
-          npm run skoolvault -- "${ARGS[@]}"
+          # Sequential: each slug → output/<slug>/ (same cookies, one browser at a time)
+          while IFS= read -r SLUG; do
+            [ -z "$SLUG" ] && continue
+            echo "::group::Pull $SLUG"
+            ARGS=(pull "$SLUG" --out output --cookies cookies.json --headless --feed --max-feed "$MAX_FEED")
+            if [ "$DO_VIDEOS" = "true" ]; then ARGS+=(--videos); fi
+            if [ "$DO_FILES" = "true" ]; then ARGS+=(--files); fi
+            if [ "$DO_COMMENTS" = "true" ]; then ARGS+=(--comments); fi
+            if [ -n "${COURSE// }" ]; then ARGS+=(--course "$COURSE"); fi
+            echo "Running: npm run skoolvault -- ${ARGS[*]}"
+            npm run skoolvault -- "${ARGS[@]}"
+            echo "::endgroup::"
+          done < slugs.txt
 
       - name: Upload archive artifact
         uses: actions/upload-artifact@v4
         with:
-          name: skoolvault-${{ steps.slug.outputs.slug }}
-          path: output/${{ steps.slug.outputs.slug }}/
+          # One zip: output/<slug-a>/, output/<slug-b>/, …
+          name: skoolvault-archive
+          path: output/
           if-no-files-found: error
           retention-days: 14
 
       - name: Cleanup cookies
         if: always()
-        run: rm -f cookies.json
+        run: rm -f cookies.json slugs.txt

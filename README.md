@@ -83,16 +83,22 @@ Password login is fragile (WAF / OAuth / 2FA). CI uses **cookies**. Same CLI wor
 1. Log in locally once → export Cookie-Editor JSON (must include `auth_token` for `skool.com`).
 2. Repo → Settings → Secrets → `SKOOL_COOKIES` = that JSON blob.
 3. Actions → **SkoolVault archive** → Run workflow — fill in:
-   - **community** — slug only, e.g. `ai-first-client-formula-8589`
+   - **community** — one slug, or **comma-separated** list:
+     `ai-first-client-formula-8589`  
+     or `group-a, group-b, group-c`
    - **videos / files / comments** — toggles (classroom + community feed always run)
    - optional **course** title filter / **max_feed**
-4. Download artifact **`skoolvault-<slug>`** — same tree as local `output/<slug>/`.
+4. Download artifact **`skoolvault-archive`** — unzip → `output/<slug>/` per community (same as local).
+
+Runs **one community after another** (shared cookies; not parallel). Job timeout 6h — keep lists short if videos are on.
 
 Local twin of a full Action run:
 
 ```bash
 npm run skoolvault -- pull ai-first-client-formula-8589 \
   --cookies ./cookies.json --headless --feed --videos --files --comments
+# Second community = second pull (or separate folders under --out):
+# npm run skoolvault -- pull other-group --out output --cookies ./cookies.json --headless --feed ...
 ```
 
 Workflow: [`.github/workflows/skoolvault.yml`](./.github/workflows/skoolvault.yml). Refresh the secret when the session expires — headless runs **fail fast** (no 5‑minute login wait).
@@ -122,6 +128,8 @@ Workflow: [`.github/workflows/skoolvault.yml`](./.github/workflows/skoolvault.ym
 - `--videos` — Mux HLS → MP4 (ffmpeg); Loom/Vimeo/YouTube/Wistia via yt-dlp when installed
 - `--files` — Skool `api2` signed downloads (re-run after a metadata-only pull will fetch missing attachments)
 - `--feed` / `--comments` — **also** scrape wall + nested comments (does not skip classroom on bare community URLs)
+- `--max-feed <n>` — keep N posts (default 50); with `--feed-sort newest` (default) = **N most recent**
+- `--feed-sort newest|oldest` — date order for community wall
 - `--course <text>` — title filter
 - `--include-locked` — don’t skip VIP courses
 - `--dry-run` — print lesson tree without writing media

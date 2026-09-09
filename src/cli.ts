@@ -91,7 +91,16 @@ program
   .option("--comments", "Fetch comment threads for feed posts", false)
   .option("--course <text>", "Only courses whose title matches this text")
   .option("--include-locked", "Include locked/VIP courses", false)
-  .option("--max-feed <n>", "Max feed posts", "50")
+  .option(
+    "--max-feed <n>",
+    "Max community posts to keep (most recent when sort=newest)",
+    "50",
+  )
+  .option(
+    "--feed-sort <order>",
+    "Feed order: newest (default) or oldest",
+    "newest",
+  )
   .option(
     "--dry-run",
     "Show what would be scraped without writing media",
@@ -137,6 +146,10 @@ program
           const n = Number(opts.maxFeed);
           return Number.isFinite(n) && n >= 0 ? n : 50;
         })(),
+        feedSort:
+          opts.feedSort === "oldest"
+            ? "oldest"
+            : ("newest" as "newest" | "oldest"),
         dryRun: Boolean(opts.dryRun),
         interactiveLogin: !opts.headless,
       });

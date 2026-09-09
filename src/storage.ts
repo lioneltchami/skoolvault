@@ -7,6 +7,7 @@ import {
   FeedPostSchema,
   LessonSchema,
 } from "./schema.js";
+import { sortFeedPostsByDate } from "./utils/feed-sort.js";
 import { slugify } from "./utils/text.js";
 
 export interface CommunityPaths {
@@ -73,7 +74,12 @@ export function writeLessonJson(file: string, data: unknown) {
 
 export function writeFeedPostsJson(
   file: string,
-  data: { posts: unknown[]; scrapedAt: string },
+  data: {
+    posts: unknown[];
+    scrapedAt: string;
+    /** After merge, keep only this many newest posts (by createdAt). */
+    keepNewest?: number;
+  },
 ) {
   const incoming = data.posts.map((p) => FeedPostSchema.parse(p));
   const existing = readJson<{ posts?: unknown[] }>(file);
@@ -104,7 +110,10 @@ export function writeFeedPostsJson(
       byId.set(p.id, p);
     }
   }
-  const posts = [...byId.values()];
+  let posts = sortFeedPostsByDate([...byId.values()], "newest");
+  if (data.keepNewest != null && data.keepNewest >= 0) {
+    posts = posts.slice(0, data.keepNewest);
+  }
   writeJson(file, { posts, scrapedAt: data.scrapedAt });
   return posts;
 }

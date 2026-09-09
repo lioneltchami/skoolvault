@@ -73,6 +73,8 @@ export interface PullOptions {
   courseFilter?: string;
   skipLocked?: boolean;
   maxFeedPosts?: number;
+  /** Feed order: newest (default) or oldest. */
+  feedSort?: "newest" | "oldest";
   delayMinMs?: number;
   delayMaxMs?: number;
   dryRun?: boolean;
@@ -611,7 +613,7 @@ async function pullCommunityInner(opts: PullOptions): Promise<void> {
     log.step("Community feed");
     const feedUrl = opts.parsed.feedQuery
       ? `${opts.parsed.communityUrl}${opts.parsed.feedQuery}`
-      : opts.parsed.communityUrl;
+      : `${opts.parsed.communityUrl}?s=${opts.feedSort === "oldest" ? "oldest" : "newest"}`;
     if (opts.rateLimit) await waitIfRateLimited(opts.rateLimit);
     await opts.page.goto(feedUrl, {
       waitUntil: "domcontentloaded",
@@ -624,8 +626,10 @@ async function pullCommunityInner(opts: PullOptions): Promise<void> {
     });
 
     const maxFeed = opts.maxFeedPosts ?? 50;
+    const feedSort = opts.feedSort ?? "newest";
     const posts = await extractFeedPosts(opts.page, maxFeed, {
       communitySlug: opts.parsed.communitySlug,
+      sort: feedSort,
     });
     if (opts.comments) {
       for (const post of posts) {
@@ -647,6 +651,7 @@ async function pullCommunityInner(opts: PullOptions): Promise<void> {
       const merged = writeFeedPostsJson(path.join(paths.feed, "posts.json"), {
         posts,
         scrapedAt: new Date().toISOString(),
+        keepNewest: feedSort === "newest" ? maxFeed : undefined,
       });
       const onlyDom =
         posts.length > 0 && posts.every((p) => p.id.startsWith("dom-"));
@@ -656,6 +661,7 @@ async function pullCommunityInner(opts: PullOptions): Promise<void> {
       log.warn(
         `Feed archived ${merged.length} post(s) (run=${posts.length}` +
           `${hitCap ? `, hit --max-feed ${maxFeed}` : ""}` +
+          `, sort=${feedSort}` +
           `${onlyDom ? ", DOM fallback" : ""}` +
           `${posts.length === 0 ? ", empty" : ""}) — status left pending (SSR snapshot only)`,
       );

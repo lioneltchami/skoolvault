@@ -1,8 +1,15 @@
 import type { Page } from "playwright";
 import { fetchNextDataPath, pageProps, readNextData } from "../next-data.js";
 import type { Comment, FeedPost } from "../schema.js";
+import { normalizeCreatedAt, sortFeedPostsByDate } from "../utils/feed-sort.js";
 import { sleep } from "../utils/text.js";
 import { tipTapToMarkdown } from "../utils/tiptap.js";
+
+export {
+	feedPostTimeMs,
+	normalizeCreatedAt,
+	sortFeedPostsByDate,
+} from "../utils/feed-sort.js";
 
 function mapUser(u: Record<string, unknown> | undefined) {
 	if (!u) return undefined;
@@ -24,11 +31,7 @@ function mapComment(node: Record<string, unknown>): Comment {
 		rootId: String(post.root_id ?? post.rootId ?? ""),
 		content: tipTapToMarkdown(rawContent) || rawContent,
 		upvotes: Number(meta.upvotes ?? 0),
-		createdAt: post.created_at
-			? String(post.created_at)
-			: post.createdAt
-				? String(post.createdAt)
-				: undefined,
+		createdAt: normalizeCreatedAt(post.created_at ?? post.createdAt),
 		user: mapUser(post.user as Record<string, unknown> | undefined),
 	};
 }
@@ -74,6 +77,12 @@ function normalizePost(
 		? commentsRaw.map((c) => mapComment(c as Record<string, unknown>))
 		: [];
 	const rawContent = String(meta.content ?? "");
+	const createdRaw =
+		core.createdAt ??
+		core.created_at ??
+		meta.createdAt ??
+		meta.created_at ??
+		meta.created;
 	return {
 		type: "feedPost",
 		id: String(core.id),
@@ -82,7 +91,7 @@ function normalizePost(
 		url: String(core.url ?? ""),
 		upvotes: Number(meta.upvotes ?? 0),
 		commentsCount: Number(meta.comments ?? comments.length),
-		createdAt: core.createdAt ? String(core.createdAt) : undefined,
+		createdAt: normalizeCreatedAt(createdRaw),
 		user: mapUser(core.user as Record<string, unknown> | undefined),
 		comments,
 		extractedAt: now,
@@ -102,8 +111,13 @@ async function scrollFeed(page: Page, rounds = 8): Promise<void> {
 export async function extractFeedPosts(
 	page: Page,
 	maxItems = 50,
-	opts?: { communitySlug?: string },
+	opts?: {
+		communitySlug?: string;
+		/** Default newest — Skool `s=newest` + local date sort + slice. */
+		sort?: "newest" | "oldest";
+	},
 ): Promise<FeedPost[]> {
+	const sort = opts?.sort ?? "newest";
 	const now = new Date().toISOString();
 	const seenIds = new Set<string>();
 	const posts: FeedPost[] = [];
@@ -114,7 +128,6 @@ export async function extractFeedPosts(
 			if (!p || seenIds.has(p.id)) continue;
 			seenIds.add(p.id);
 			posts.push(p);
-			if (posts.length >= maxItems) return;
 		}
 	};
 
@@ -133,10 +146,12 @@ export async function extractFeedPosts(
 			.replace(/^https?:\/\/(www\.)?skool\.com\//, "")
 			.split(/[/?#]/)[0] ||
 		"";
-	if (slug && posts.length < maxItems) {
-		for (let p = 1; p <= 10 && posts.length < maxItems; p++) {
+	const skoolSort = sort === "oldest" ? "oldest" : "newest";
+	const maxPages = Math.min(50, Math.max(12, Math.ceil(maxItems / 10) + 4));
+	if (slug) {
+		for (let p = 1; p <= maxPages && posts.length < maxItems * 2; p++) {
 			const raw = await fetchNextDataPath(page, slug, {
-				s: "newest",
+				s: skoolSort,
 				p: String(p),
 			});
 			if (!raw) break;
@@ -146,13 +161,13 @@ export async function extractFeedPosts(
 			if (batch.length === 0) break;
 			const before = posts.length;
 			addRaw(batch);
-			if (posts.length === before) break; // no new ids
+			if (posts.length === before) break;
 		}
 	}
 
-	// 3) Scroll + collect post links, then light card text
+	// 3) Scroll fallback only if still empty
 	if (posts.length === 0) {
-		await scrollFeed(page);
+		await scrollFeed(page, Math.min(20, Math.ceil(maxItems / 5)));
 		const fromDom = await page.evaluate((limit) => {
 			const out: {
 				id: string;
@@ -165,7 +180,6 @@ export async function extractFeedPosts(
 
 			for (const a of Array.from(document.querySelectorAll("a[href]"))) {
 				const href = a.getAttribute("href") || "";
-				// /{slug}/{32-hex-id} post URLs
 				const m =
 					href.match(
 						new RegExp(`^/(?:${slug}/)?([a-f0-9]{20,40})(?:\\?|#|$)`, "i"),
@@ -235,11 +249,10 @@ export async function extractFeedPosts(
 				comments: [],
 				extractedAt: now,
 			});
-			if (posts.length >= maxItems) break;
 		}
 	}
 
-	return posts;
+	return sortFeedPostsByDate(posts, sort).slice(0, maxItems);
 }
 
 export async function fetchPostComments(
