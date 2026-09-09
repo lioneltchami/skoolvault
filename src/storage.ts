@@ -87,7 +87,22 @@ export function writeFeedPostsJson(
     }
   }
   for (const p of incoming) {
-    byId.set(p.id, p); // new wins
+    const prev = byId.get(p.id);
+    // Flag flip `--comments` off must not wipe previously archived threads
+    if (
+      prev &&
+      (!p.comments || p.comments.length === 0) &&
+      prev.comments &&
+      prev.comments.length > 0
+    ) {
+      byId.set(p.id, {
+        ...p,
+        comments: prev.comments,
+        commentsCount: Math.max(p.commentsCount ?? 0, prev.commentsCount ?? 0),
+      });
+    } else {
+      byId.set(p.id, p);
+    }
   }
   const posts = [...byId.values()];
   writeJson(file, { posts, scrapedAt: data.scrapedAt });

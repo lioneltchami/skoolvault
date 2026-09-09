@@ -11,10 +11,12 @@ import {
 import { extractFeedPosts, fetchPostComments } from "./extractors/feed.js";
 import { extractLessonBody } from "./extractors/lesson-content.js";
 import {
-  externalVideoHints,
+  buildExternalExpected,
+  externalVideoPath,
   lessonNeedsRework,
   mergePriorLocalPaths,
   resolveLessonBase,
+  urlHash,
 } from "./lesson-resume.js";
 import { downloadSkoolFile } from "./media/files.js";
 import {
@@ -178,9 +180,6 @@ async function scrapeOneCourse(
   progress: ProgressState,
   paths: ReturnType<typeof communityPaths>,
 ): Promise<void> {
-  const folderKey = courseFolderKey(course);
-  const layout = ensureCourseLayout(paths, folderKey);
-
   const loaded = await loadCoursePage(
     opts.page,
     opts.parsed.communityUrl,
@@ -195,16 +194,21 @@ async function scrapeOneCourse(
   const hashFromUrl = opts.page.url().match(/\/classroom\/([^/?#]+)/)?.[1];
   if (hashFromUrl) course.nameHash = hashFromUrl;
 
+  // folderKey AFTER hash recovery so DOM-only courses don't orphan on next run
+  const folderKey = courseFolderKey(course);
+  const layout = ensureCourseLayout(paths, folderKey);
+
   writeJson(layout.courseJson, {
     ...course,
     scrapedAt: new Date().toISOString(),
   });
 
+  const courseUrl = `${opts.parsed.communityUrl}/classroom/${course.nameHash}`;
   await ensureAuth(
     opts.page,
     opts.parsed.communityUrl,
     opts.sessionFile,
-    opts.page.url(),
+    courseUrl,
   );
 
   const tree = await extractCourseLessonTree(opts.page);
@@ -237,18 +241,32 @@ async function scrapeOneCourse(
     );
     const outMp4 = path.join(layout.media, `${base}.mp4`);
     const videoKey = `${folderKey}:${node.id}`;
-    const externalsHint = externalVideoHints(node);
-    const externalExpected = externalsHint
-      .filter((v) => ["loom", "vimeo", "youtube", "wistia"].includes(v.source))
-      .map((v, i) => ({
-        path: path.join(layout.media, `${base}-${v.source}-${i + 1}.mp4`),
-      }));
+    const existingLesson = readJson<{
+      files?: { fileId?: string; localPath?: string }[];
+      videos?: {
+        source: string;
+        url?: string;
+        playbackId?: string;
+        localPath?: string;
+      }[];
+      content?: string;
+    }>(lessonJsonPath);
+
+    const externalExpected = buildExternalExpected(
+      layout.media,
+      base,
+      node,
+      existingLesson?.videos as import("./schema.js").VideoRef[] | undefined,
+    );
     const wantedFileIds = parseResources(node.resourcesRaw)
       .map((r) => r.fileId)
       .filter((id): id is string => Boolean(id));
-    const existingLesson = readJson<{
-      files?: { fileId?: string; localPath?: string }[];
-    }>(lessonJsonPath);
+
+    const priorMuxId = existingLesson?.videos?.find(
+      (v) => v.source === "mux" && v.localPath,
+    )?.playbackId;
+    const muxPlaybackIdMatches =
+      !node.videoId || !priorMuxId || priorMuxId === node.videoId;
 
     const rework = lessonNeedsRework({
       lessonDone: isLessonDone(progress, folderKey, node.id),
@@ -256,6 +274,7 @@ async function scrapeOneCourse(
       files: Boolean(opts.files),
       muxVideoId: node.videoId,
       muxMp4Exists: fs.existsSync(outMp4),
+      muxPlaybackIdMatches,
       muxVideoFailed: isVideoFailed(progress, videoKey),
       externalExpected,
       fileIdsWanted: wantedFileIds,
@@ -296,24 +315,30 @@ async function scrapeOneCourse(
     const content =
       (await extractLessonBody(opts.page, node.id)) || node.desc || "";
 
-    const videos = detectExternalVideoUrls(
-      content + " " + (node.resourcesRaw || "") + " " + (node.videoLink || ""),
-    );
-    if (node.videoLink) {
-      const fromMeta = detectExternalVideoUrls(node.videoLink);
-      for (const v of fromMeta) {
-        if (!videos.some((x) => x.url === v.url)) videos.push(v);
-      }
-    }
+    // Same corpus for detect + download (desc + live body + resources + videoLink)
+    const videoCorpus = [content, node.desc, node.resourcesRaw, node.videoLink]
+      .filter(Boolean)
+      .join(" ");
+    const videos = detectExternalVideoUrls(videoCorpus);
     const resources = parseResources(node.resourcesRaw);
     const files = [];
     let artifactsOk = true;
+
+    if (
+      content.trim().length < 20 &&
+      (existingLesson?.content?.trim().length ?? 0) >= 20
+    ) {
+      // mergePrior will restore text; still flag partial so we retry extraction
+      log.warn(`Thin lesson body for ${node.title} — keeping prior content`);
+      artifactsOk = false;
+    }
 
     if (opts.videos && node.videoId) {
       if (
         !isVideoDone(progress, videoKey) ||
         isVideoFailed(progress, videoKey) ||
-        !fs.existsSync(outMp4)
+        !fs.existsSync(outMp4) ||
+        !muxPlaybackIdMatches
       ) {
         try {
           const ref = await resolveAndDownloadMux({
@@ -364,11 +389,8 @@ async function scrapeOneCourse(
       );
       for (let i = 0; i < externals.length; i++) {
         const v = externals[i]!;
-        const extKey = `${folderKey}:${node.id}:ext:${v.source}:${i}`;
-        const extPath = path.join(
-          layout.media,
-          `${base}-${v.source}-${i + 1}.mp4`,
-        );
+        const extPath = externalVideoPath(layout.media, base, v.source, v.url!);
+        const extKey = `${folderKey}:${node.id}:ext:${v.source}:${urlHash(v.url!)}`;
         if (isVideoDone(progress, extKey) && fs.existsSync(extPath)) {
           v.localPath = extPath;
           continue;
@@ -541,10 +563,13 @@ async function pullCommunityInner(opts: PullOptions): Promise<void> {
       );
     }
 
-    writeJson(path.join(paths.courses, "index.json"), {
-      courses,
-      scrapedAt: new Date().toISOString(),
-    });
+    // Never clobber a good index with [] when courseFilter/courseHash bypassed the throw
+    if (courses.length > 0) {
+      writeJson(path.join(paths.courses, "index.json"), {
+        courses,
+        scrapedAt: new Date().toISOString(),
+      });
+    }
     log.info(`Found ${courses.length} course(s)`);
 
     if (opts.parsed.courseHash) {
@@ -622,18 +647,14 @@ async function pullCommunityInner(opts: PullOptions): Promise<void> {
       const onlyDom =
         posts.length > 0 && posts.every((p) => p.id.startsWith("dom-"));
       const hitCap = posts.length >= maxFeed;
-      // SSR feed is a partial snapshot — don't certify "complete" when we
-      // clearly hit the page-size ceiling or only got DOM stubs.
-      if (onlyDom || hitCap) {
-        progress.feed.status = "pending";
-        log.warn(
-          `Feed archived ${merged.length} post(s) (run=${posts.length}` +
-            `${hitCap ? `, hit --max-feed ${maxFeed}` : ""}` +
-            `${onlyDom ? ", DOM fallback" : ""}) — status left pending`,
-        );
-      } else {
-        progress.feed.status = "complete";
-      }
+      // SSR is one page — never mark feed complete without real pagination
+      progress.feed.status = "pending";
+      log.warn(
+        `Feed archived ${merged.length} post(s) (run=${posts.length}` +
+          `${hitCap ? `, hit --max-feed ${maxFeed}` : ""}` +
+          `${onlyDom ? ", DOM fallback" : ""}` +
+          `${posts.length === 0 ? ", empty" : ""}) — status left pending (SSR snapshot only)`,
+      );
       saveProgress(paths.progress, progress);
     }
     log.ok(`Feed posts this run: ${posts.length}`);

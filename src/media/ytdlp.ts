@@ -21,10 +21,28 @@ export function assertYtDlpAvailable(): void {
   );
 }
 
+function clearStaleYtDlpSiblings(outputPath: string): void {
+  const dir = path.dirname(outputPath);
+  const stem = path.basename(outputPath).replace(/\.mp4$/i, "");
+  if (!fs.existsSync(dir)) return;
+  for (const f of fs.readdirSync(dir)) {
+    if (f === `${stem}.mp4`) continue;
+    if (!f.startsWith(`${stem}.`)) continue;
+    try {
+      fs.unlinkSync(path.join(dir, f));
+    } catch {
+      // ignore
+    }
+  }
+}
+
 function runYtDlp(url: string, outputPath: string): Promise<void> {
   return new Promise((resolve, reject) => {
     fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-    const outTemplate = outputPath.replace(/\.mp4$/i, "") + ".%(ext)s";
+    clearStaleYtDlpSiblings(outputPath);
+    // Stage away from final path so a crash can't leave a "complete" stub
+    const partBase = `${outputPath}.part`;
+    const outTemplate = `${partBase}.%(ext)s`;
     const args = [
       "--no-playlist",
       "--no-warnings",
@@ -40,16 +58,38 @@ function runYtDlp(url: string, outputPath: string): Promise<void> {
       stdio: ["ignore", "ignore", "pipe"],
     });
     let err = "";
+    let settled = false;
+    const cleanupPart = () => {
+      const dir = path.dirname(outputPath);
+      const prefix = path.basename(partBase);
+      if (!fs.existsSync(dir)) return;
+      for (const f of fs.readdirSync(dir)) {
+        if (f.startsWith(prefix)) {
+          try {
+            fs.unlinkSync(path.join(dir, f));
+          } catch {
+            // ignore
+          }
+        }
+      }
+    };
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
-      reject(new Error(`yt-dlp timed out after ${YTDLP_TIMEOUT_MS / 1000}s`));
+      if (!settled) {
+        settled = true;
+        cleanupPart();
+        reject(new Error(`yt-dlp timed out after ${YTDLP_TIMEOUT_MS / 1000}s`));
+      }
     }, YTDLP_TIMEOUT_MS);
 
     child.stderr.on("data", (d) => {
       err += d.toString();
     });
     child.on("error", (e) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
+      cleanupPart();
       reject(
         e.message.includes("ENOENT")
           ? new Error("yt-dlp not found on PATH")
@@ -57,27 +97,30 @@ function runYtDlp(url: string, outputPath: string): Promise<void> {
       );
     });
     child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
       if (code === 0) resolve();
-      else reject(new Error(err.slice(-500) || `yt-dlp exited ${code}`));
+      else {
+        cleanupPart();
+        reject(new Error(err.slice(-500) || `yt-dlp exited ${code}`));
+      }
     });
   });
 }
 
-function findDownloadedFile(basePathWithoutExt: string): string | null {
-  const dir = path.dirname(basePathWithoutExt);
-  const base = path.basename(basePathWithoutExt);
+function findDownloadedFile(partBase: string): string | null {
+  const dir = path.dirname(partBase);
+  const base = path.basename(partBase);
   if (!fs.existsSync(dir)) return null;
   const files = fs.readdirSync(dir);
   const exact = files.find((f) => f === `${base}.mp4`);
   if (exact) return path.join(dir, exact);
-  // Prefer real containers over yt-dlp fragments (.f137.mp4, .part, …)
   const container = files.find(
     (f) =>
       f.startsWith(`${base}.`) &&
       /\.(mp4|mkv|webm|mov|m4v)$/i.test(f) &&
-      !/\.f\d+\./i.test(f) &&
-      !f.endsWith(".part"),
+      !/\.f\d+\./i.test(f),
   );
   return container ? path.join(dir, container) : null;
 }
@@ -95,14 +138,24 @@ export async function downloadExternalVideo(opts: {
     return { source: opts.source, url: opts.url, localPath: opts.outputPath };
   }
 
-  const base = opts.outputPath.replace(/\.mp4$/i, "");
+  const partBase = `${opts.outputPath}.part`;
   await runYtDlp(opts.url, opts.outputPath);
-  const found = findDownloadedFile(base);
+  const found = findDownloadedFile(partBase);
   if (!found) {
     throw new Error(`yt-dlp produced no file for ${opts.url}`);
   }
-  if (found !== opts.outputPath) {
-    fs.renameSync(found, opts.outputPath);
+  fs.renameSync(found, opts.outputPath);
+  // tidy any leftover part siblings
+  const dir = path.dirname(opts.outputPath);
+  const prefix = path.basename(partBase);
+  for (const f of fs.readdirSync(dir)) {
+    if (f.startsWith(prefix)) {
+      try {
+        fs.unlinkSync(path.join(dir, f));
+      } catch {
+        // ignore
+      }
+    }
   }
   if (
     !fs.existsSync(opts.outputPath) ||

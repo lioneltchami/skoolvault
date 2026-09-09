@@ -3,9 +3,15 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { normalizeSameSite } from "./auth.js";
-import { lessonNeedsRework, mergePriorLocalPaths } from "./lesson-resume.js";
+import {
+  buildExternalExpected,
+  externalVideoPath,
+  lessonNeedsRework,
+  mergePriorLocalPaths,
+  urlHash,
+} from "./lesson-resume.js";
 import type { Lesson } from "./schema.js";
-import { writeJson } from "./storage.js";
+import { writeFeedPostsJson, writeJson } from "./storage.js";
 
 function check(name: string, fn: () => void) {
   try {
@@ -25,9 +31,39 @@ check("normalizeSameSite maps Cookie-Editor values", () => {
   assert.equal(normalizeSameSite(undefined), "Lax");
 });
 
-check("P2: completed Loom-only lesson needs rework when mp4 missing", () => {
+check("external paths are URL-stable (not index-based)", () => {
+  const a = externalVideoPath(
+    "/m",
+    "01-x",
+    "loom",
+    "https://loom.com/share/aaa",
+  );
+  const b = externalVideoPath("/m", "01-x", "youtube", "https://youtu.be/bbb");
+  const a2 = externalVideoPath(
+    "/m",
+    "01-x",
+    "loom",
+    "https://loom.com/share/aaa",
+  );
+  assert.equal(a, a2);
+  assert.notEqual(a, b);
+  assert.ok(a.includes(urlHash("https://loom.com/share/aaa")));
+});
+
+check("P2: Loom in prior JSON forces rework when mp4 missing", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sv-ext-"));
-  const missing = path.join(dir, "01-x-loom-1.mp4");
+  const expected = buildExternalExpected(
+    dir,
+    "01-x",
+    { id: "l1", title: "T", position: 1 },
+    [
+      {
+        source: "loom",
+        url: "https://www.loom.com/share/abc123",
+      },
+    ],
+  );
+  assert.equal(expected.length, 1);
   assert.equal(
     lessonNeedsRework({
       lessonDone: true,
@@ -35,8 +71,9 @@ check("P2: completed Loom-only lesson needs rework when mp4 missing", () => {
       files: false,
       muxVideoId: undefined,
       muxMp4Exists: false,
+      muxPlaybackIdMatches: true,
       muxVideoFailed: false,
-      externalExpected: [{ path: missing }],
+      externalExpected: expected,
       fileIdsWanted: [],
     }),
     true,
@@ -44,28 +81,39 @@ check("P2: completed Loom-only lesson needs rework when mp4 missing", () => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-check("P2: completed lesson with all externals present skips", () => {
+check("P2: desc loom + body youtube share URL-hashed paths", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sv-ext2-"));
-  const present = path.join(dir, "01-x-loom-1.mp4");
-  fs.writeFileSync(present, "x".repeat(2000));
+  const loom = "https://www.loom.com/share/aaa";
+  const yt = "https://youtu.be/bbb";
+  const fromHints = buildExternalExpected(dir, "01-x", {
+    id: "l1",
+    title: "T",
+    position: 1,
+    desc: `watch ${yt}`,
+    videoLink: loom,
+  });
+  const fromBody = buildExternalExpected(
+    dir,
+    "01-x",
+    { id: "l1", title: "T", position: 1, videoLink: loom },
+    undefined,
+    `body has ${loom} and ${yt}`,
+  );
+  const pathsHints = new Set(fromHints.map((e) => e.path));
+  const pathsBody = new Set(fromBody.map((e) => e.path));
+  assert.ok(pathsHints.has(externalVideoPath(dir, "01-x", "loom", loom)));
+  assert.ok(pathsBody.has(externalVideoPath(dir, "01-x", "loom", loom)));
+  assert.ok(pathsBody.has(externalVideoPath(dir, "01-x", "youtube", yt)));
+  // same URL → same path across corpora (no loom-1 vs loom-2 skew)
   assert.equal(
-    lessonNeedsRework({
-      lessonDone: true,
-      videos: true,
-      files: false,
-      muxVideoId: undefined,
-      muxMp4Exists: false,
-      muxVideoFailed: false,
-      externalExpected: [{ path: present }],
-      fileIdsWanted: [],
-    }),
-    false,
+    externalVideoPath(dir, "01-x", "loom", loom),
+    fromBody.find((e) => e.url === loom)!.path,
   );
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
 check(
-  "P2: mergePriorLocalPaths keeps downloaded paths across flag flips",
+  "P2: mergePriorLocalPaths keeps content + paths; no cross-mux match",
   () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sv-merge-"));
     const mp4 = path.join(dir, "vid.mp4");
@@ -82,7 +130,7 @@ check(
       section: "",
       title: "T",
       position: 1,
-      content: "old",
+      content: "FULL LESSON TRANSCRIPT KEEP ME",
       url: "https://www.skool.com/g/classroom/h?md=l1",
       videos: [{ source: "mux", playbackId: "abc", localPath: mp4 }],
       files: [{ fileId: "fid1", name: "notes.pdf", localPath: pdf }],
@@ -93,15 +141,83 @@ check(
 
     const next: Lesson = {
       ...prior,
-      content: "new",
+      content: "",
       videos: [{ source: "mux", playbackId: "abc" }],
       files: [{ fileId: "fid1", name: "notes.pdf" }],
     };
     const merged = mergePriorLocalPaths(next, priorPath);
+    assert.equal(merged.content, "FULL LESSON TRANSCRIPT KEEP ME");
     assert.equal(merged.videos[0]?.localPath, mp4);
     assert.equal(merged.files[0]?.localPath, pdf);
+
+    const swapped: Lesson = {
+      ...prior,
+      content: "x".repeat(30),
+      videos: [{ source: "mux", playbackId: "TOTALLY-DIFFERENT" }],
+      files: [],
+    };
+    const noSteal = mergePriorLocalPaths(swapped, priorPath);
+    assert.equal(noSteal.videos[0]?.localPath, undefined);
     fs.rmSync(dir, { recursive: true, force: true });
   },
 );
+
+check("P2: feed merge keeps comments across --comments flip", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sv-feed-"));
+  const file = path.join(dir, "posts.json");
+  writeFeedPostsJson(file, {
+    posts: [
+      {
+        type: "feedPost",
+        id: "p1",
+        title: "A",
+        content: "c",
+        url: "",
+        upvotes: 0,
+        commentsCount: 2,
+        comments: [
+          {
+            id: "c1",
+            parentId: "",
+            rootId: "",
+            content: "hi",
+            upvotes: 0,
+          },
+          {
+            id: "c2",
+            parentId: "",
+            rootId: "",
+            content: "yo",
+            upvotes: 0,
+          },
+        ],
+        extractedAt: "2026-01-01T00:00:00.000Z",
+      },
+    ],
+    scrapedAt: "2026-01-01T00:00:00.000Z",
+  });
+  writeFeedPostsJson(file, {
+    posts: [
+      {
+        type: "feedPost",
+        id: "p1",
+        title: "A",
+        content: "c",
+        url: "",
+        upvotes: 1,
+        commentsCount: 0,
+        comments: [],
+        extractedAt: "2026-01-02T00:00:00.000Z",
+      },
+    ],
+    scrapedAt: "2026-01-02T00:00:00.000Z",
+  });
+  const raw = JSON.parse(fs.readFileSync(file, "utf8")) as {
+    posts: { comments: unknown[]; commentsCount: number }[];
+  };
+  assert.equal(raw.posts[0]!.comments.length, 2);
+  assert.equal(raw.posts[0]!.commentsCount, 2);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
 
 console.log("\nP2 resume/auth tests passed");

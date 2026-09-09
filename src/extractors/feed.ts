@@ -103,9 +103,17 @@ export async function extractFeedPosts(
     }, maxItems);
 
     for (const p of fromDom) {
+      const seed = `${p.title}\n${p.content.slice(0, 240)}`;
+      let h = 0;
+      for (let i = 0; i < seed.length; i++) {
+        h = (Math.imul(31, h) + seed.charCodeAt(i)) >>> 0;
+      }
+      const stableId = p.id.startsWith("dom-") ? `dom-${h.toString(16)}` : p.id;
+      if (seenIds.has(stableId)) continue;
+      seenIds.add(stableId);
       posts.push({
         type: "feedPost",
-        id: p.id,
+        id: stableId,
         title: p.title,
         content: p.content,
         url: "",
